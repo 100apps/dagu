@@ -267,3 +267,7 @@ steps:
       fallback:
         - provider: codex
 ```
+
+## ACP protocol extension
+
+Custom harness providers support `protocol: acp`. See the [ACP extension specification](067-harness-acp.md) for configuration and acceptance criteria.

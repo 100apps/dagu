@@ -64,6 +64,7 @@ type containerRunResult struct {
 type harnessExecutor struct {
 	mu                     sync.Mutex
 	process                *cmdutil.ManagedProcess
+	acpCancel              context.CancelFunc
 	stdout                 io.Writer
 	stderr                 io.Writer
 	exitCode               int
@@ -154,6 +155,7 @@ func (e *harnessExecutor) Stop(intent cmdutil.TerminationIntent) error {
 	return e.stop(cmdutil.StopRequest{Intent: intent})
 }
 
+// stop cancels an ACP turn or forwards the stop request to the active execution backend.
 func (e *harnessExecutor) stop(req cmdutil.StopRequest) error {
 	e.mu.Lock()
 	host := e.managedHost
@@ -162,6 +164,7 @@ func (e *harnessExecutor) stop(req cmdutil.StopRequest) error {
 		sessionID = e.agentSession.SessionID
 	}
 	workDir := e.workDir
+	acpCancel := e.acpCancel
 	process := e.process
 	cli := e.containerClient
 	containerCancel := e.containerCancel
@@ -170,6 +173,10 @@ func (e *harnessExecutor) stop(req cmdutil.StopRequest) error {
 	e.sharedContainerCancel = nil
 	e.mu.Unlock()
 
+	if acpCancel != nil {
+		acpCancel()
+		return nil
+	}
 	var stopErr error
 	if host.URL != "" && sessionID != "" {
 		stopErr = abortManagedOpenCode(context.Background(), host, sessionID, workDir)
@@ -229,6 +236,7 @@ func (e *harnessExecutor) effectivePrompt() string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
+// Run tries providers in order and publishes only the successful attempt's output.
 func (e *harnessExecutor) Run(ctx context.Context) error {
 	var lastErr error
 
@@ -244,6 +252,9 @@ func (e *harnessExecutor) Run(ctx context.Context) error {
 		}
 
 		lastErr = err
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
 		if ctx.Err() != nil {
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				e.exitCode = 124 // Standard timeout exit code
@@ -275,7 +286,11 @@ func (e *harnessExecutor) Run(ctx context.Context) error {
 	return nil
 }
 
+// runOnce dispatches one provider attempt to its protocol and execution backend.
 func (e *harnessExecutor) runOnce(ctx context.Context, cfg providerConfig) (*os.File, error) {
+	if cfg.definition != nil && cfg.definition.Protocol == "acp" {
+		return e.runACP(ctx, cfg)
+	}
 	hasRootContainer := rootContainerConfigured(ctx)
 	if cfg.managed && e.step.Container == nil && !hasRootContainer {
 		host, available, err := opencodehost.ConfigFromContext(ctx)
@@ -1385,11 +1400,17 @@ func knownProviders(defs ir.HarnessDefinitions) []string {
 	return names
 }
 
+// cloneDefinition copies a reusable harness definition without sharing mutable options.
 func cloneDefinition(def *ir.HarnessDefinition) *ir.HarnessDefinition {
 	if def == nil {
 		return nil
 	}
 	return &ir.HarnessDefinition{
+		Protocol:       def.Protocol,
+		Transport:      def.Transport,
+		URL:            def.URL,
+		Headers:        maps.Clone(def.Headers),
+		Cwd:            def.Cwd,
 		Binary:         def.Binary,
 		PrefixArgs:     append([]string(nil), def.PrefixArgs...),
 		PromptMode:     def.PromptMode,
