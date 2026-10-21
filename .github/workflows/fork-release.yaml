@@ -25,9 +25,17 @@ jobs:
         with:
           node-version: 22
 
-      - name: Prepare a unique version
+      - name: Resolve the version
         id: version
-        run: echo "version=0.0.0-push.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+        run: |
+          # Derive a semantic dev version from the nearest upstream release tag,
+          # e.g. 2.21.0-dev.65341a4. Falls back to 0.0.0-dev.<sha> when the
+          # upstream tags are unreachable.
+          git fetch --quiet --depth=200 --no-tags https://github.com/dagucloud/dagu.git \
+            "+refs/tags/v*:refs/tags/upstream-v*" || true
+          base=$(git describe --tags --match "upstream-v*" --abbrev=0 2>/dev/null | sed "s/^upstream-v//" || true)
+          base=${base:-0.0.0}
+          echo "version=${base}-dev.${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Build web UI
         run: |

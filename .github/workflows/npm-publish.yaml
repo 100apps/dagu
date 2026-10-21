@@ -23,6 +23,7 @@ jobs:
   # This prevents shell injection: a crafted version string could otherwise execute
   # arbitrary code when interpolated into shell via ${{ inputs.version }}.
   validate-inputs:
+    if: github.repository == 'dagucloud/dagu'
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -40,6 +41,7 @@ jobs:
 
   # First, publish all platform-specific packages
   publish-platform-packages:
+    if: github.repository == 'dagucloud/dagu'
     needs: validate-inputs
     runs-on: ubuntu-latest
     strategy:
@@ -200,6 +202,7 @@ jobs:
 
   # Then publish the main package that depends on platform packages
   publish-main-package:
+    if: github.repository == 'dagucloud/dagu'
     needs: [validate-inputs, publish-platform-packages]
     if: ${{ always() && needs.validate-inputs.result == 'success' && needs.publish-platform-packages.result == 'success' }}
     runs-on: ubuntu-latest
@@ -307,6 +310,7 @@ jobs:
 
   # Verify the published packages
   verify-packages:
+    if: github.repository == 'dagucloud/dagu'
     needs: [validate-inputs, publish-platform-packages, publish-main-package]
     if: ${{ always() && needs.validate-inputs.result == 'success' && needs.publish-main-package.result == 'success' }}
     runs-on: ${{ matrix.os }}
