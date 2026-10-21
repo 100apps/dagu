@@ -1,0 +1,82 @@
+name: Fork push release
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == '100apps/dagu'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the pushed commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 22
+
+      - name: Build web UI
+        run: |
+          npm install --global pnpm@10
+          pnpm --dir ui install --frozen-lockfile
+          pnpm --dir ui build
+          cp -a ui/dist/. internal/service/frontend/assets/
+
+      - name: Prepare a unique version
+        run: |
+          version="0.0.0-push.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}.${GITHUB_SHA:0:7}"
+          echo "RELEASE_VERSION=${version}" >> "$GITHUB_ENV"
+          # Snapshot mode reuses the upstream build/archive configuration without
+          # publishing to its Homebrew taps or requiring its release credentials.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          config = Path('.goreleaser.yaml').read_text()
+          original = 'version_template: "{{ incpatch .Version }}-next"'
+          replacement = 'version_template: "{{ .Env.RELEASE_VERSION }}"'
+          assert config.count(original) == 1, 'Snapshot version template changed'
+          Path(os.environ['RUNNER_TEMP'], 'fork-goreleaser.yaml').write_text(config.replace(original, replacement))
+          PY
+
+      - name: Build release archives
+        uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
+        with:
+          version: '~> v2'
+          args: release --snapshot --clean --config ${{ runner.temp }}/fork-goreleaser.yaml
+
+      - name: Verify the Linux binary
+        run: |
+          binary="$(find dist -path '*linux_amd64*/dagu' -type f -print -quit)"
+          test -n "$binary"
+          "$binary" version | tee "$RUNNER_TEMP/version.txt"
+          grep -F -- "$RELEASE_VERSION" "$RUNNER_TEMP/version.txt"
+          (cd dist && sha256sum --check checksums.txt)
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${RELEASE_VERSION}"
+          printf 'Automatic build of `%s` at commit `%s`.\n\nIncludes the web UI. These are fork prerelease builds.\n' \
+            "$GITHUB_REF_NAME" "$GITHUB_SHA" > "$RUNNER_TEMP/release-notes.md"
+          mapfile -t archives < <(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | sort)
+          test "${#archives[@]}" -gt 0
+          gh release create "$tag" "${archives[@]}" dist/checksums.txt \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "${GITHUB_REF_NAME} · ${RELEASE_VERSION}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" --prerelease
