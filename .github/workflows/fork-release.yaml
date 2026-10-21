@@ -19,6 +19,10 @@ jobs:
     steps:
       - name: Check out the pushed commit
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Full history so `git describe` can reach the upstream release
+          # tags when deriving the dev version below.
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
@@ -35,6 +39,7 @@ jobs:
             "+refs/tags/v*:refs/tags/upstream-v*" || true
           base=$(git describe --tags --match "upstream-v*" --abbrev=0 2>/dev/null | sed "s/^upstream-v//" || true)
           base=${base:-0.0.0}
+          echo "base tag: ${base}"
           echo "version=${base}-dev.${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Build web UI
