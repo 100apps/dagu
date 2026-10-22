@@ -1498,10 +1498,20 @@
           }
         },
         {
-          "if": {"properties": {"type": {"const": "local"}}, "required": ["type"]},
+          "if": {
+            "properties": {
+              "type": { "const": "local" }
+            },
+            "required": ["type"]
+          },
           "then": {
             "required": ["path"],
-            "properties": {"path": {"minLength": 1, "pattern": "^\\s*(/|[A-Za-z]:[/\\\\]|\\\\\\\\[^\\\\]+\\\\[^\\\\]+)"}}
+            "properties": {
+              "path": {
+                "minLength": 1,
+                "pattern": "^\\s*(/|[A-Za-z]:[/\\\\]|\\\\\\\\[^\\\\]+\\\\[^\\\\]+)"
+              }
+            }
           }
         }
       ]
