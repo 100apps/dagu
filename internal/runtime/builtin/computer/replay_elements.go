@@ -4,6 +4,7 @@
 package computer
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/desktop"
 	"github.com/dagucloud/dagu/v2/internal/llm/computeruse"
+	"github.com/dagucloud/dagu/v2/internal/runtime/builtin/internal/agentstep"
 )
 
 const (
@@ -302,7 +304,6 @@ func windowMatchesRecorded(w desktop.WindowID, app, title string) bool {
 // is not there. The window in front must be the application the element was
 // recorded in.
 func (r *run) lookRecorded(els desktop.Elements, rec recordedElement) (desktop.Element, string, error) {
-	sel := substituteSelector(rec.Selector, r.variables)
 	front, err := els.FrontWindow()
 	if errors.Is(err, desktop.ErrNoWindow) {
 		return desktop.Element{}, err.Error(), nil
@@ -310,6 +311,28 @@ func (r *run) lookRecorded(els desktop.Elements, rec recordedElement) (desktop.E
 	if err != nil {
 		return desktop.Element{}, "", err
 	}
+	title := r.substitute(rec.Window)
+	held := front.Role == desktop.RoleDialog && r.dialogHolds(front, r.recordedWindow(rec.App, title), rec.App, title)
+	// A dialog that holds the recorded window is not searched when the
+	// recording names another window: a window matches by its application
+	// alone, and a match in the dialog would answer a question the
+	// recording never saw.
+	if held && title != "" {
+		return desktop.Element{}, describeDialog(els, front), nil
+	}
+	found, reason, err := r.lookIn(els, front, rec)
+	// Such a dialog is why the element is not there, whatever else the
+	// look found.
+	if err == nil && reason != "" && held {
+		reason = describeDialog(els, front)
+	}
+	return found, reason, err
+}
+
+// lookIn finds a recorded element in the window in front, or says why it
+// is not there.
+func (r *run) lookIn(els desktop.Elements, front desktop.Element, rec recordedElement) (desktop.Element, string, error) {
+	sel := substituteSelector(rec.Selector, r.variables)
 	if ok, reason := r.frontMatches(front, rec.App, rec.Window); !ok {
 		return desktop.Element{}, reason, nil
 	}
@@ -388,18 +411,42 @@ const foregroundSettle = 200 * time.Millisecond
 // so a replay acts on it even after it lost the focus. The window is matched
 // by its application; among several windows of that application the one whose
 // title still matches is preferred. It never raises the step's own
-// application, and is a best effort: the look that follows still checks the
-// front window. title is already substituted.
+// application, nor a window a dialog of its application holds, since acting
+// in it would go past a question nobody answered. It is a best effort: the
+// look that follows still checks the front window. title is already
+// substituted.
 func (r *run) bringForward(ctx context.Context, index int, app, title string) {
-	if app == "" && title == "" {
+	target := r.recordedWindow(app, title)
+	if target == nil {
 		return
+	}
+	// Already acting on the best window? Leave it; only raise when a better
+	// window than the one in front is open.
+	if front := r.driver.FocusedWindow(); front.Known() && front.Handle == target.Handle {
+		return
+	}
+	if els, err := r.elementsIfAvailable(); err == nil && r.heldByDialog(els, target, app, title) {
+		return
+	}
+	if err := r.driver.Raise(*target); err != nil {
+		return
+	}
+	logAction(r.timeline, index, fmt.Sprintf("bringing %q to the front", target.Title))
+	_ = sleep(ctx, foregroundSettle)
+}
+
+// recordedWindow chooses the window bringForward raises, or returns nil
+// when none is open. title is already substituted.
+func (r *run) recordedWindow(app, title string) *desktop.WindowID {
+	if app == "" && title == "" {
+		return nil
 	}
 	// Choose the best window before looking at the focused one: a window of
 	// the recorded app whose title still matches is preferred, so a second
 	// document of the same application does not win just by holding the
 	// focus; any window of the app is the fallback.
 	windows := r.driver.Windows()
-	var best, any *desktop.WindowID
+	var any *desktop.WindowID
 	for i := range windows {
 		w := windows[i]
 		if r.driver.Owned(w) || !windowMatchesRecorded(w, app, title) {
@@ -409,27 +456,65 @@ func (r *run) bringForward(ctx context.Context, index int, app, title string) {
 			any = &windows[i]
 		}
 		if title != "" && desktop.WindowMatches(w.Title, title) {
-			best = &windows[i]
-			break
+			return &windows[i]
 		}
 	}
-	target := best
-	if target == nil {
-		target = any
+	return any
+}
+
+// heldByDialog reports whether a dialog in front holds the recorded
+// window; see dialogHolds. A front window it cannot read may be such a
+// dialog, so it holds the window too; only no window in front holds none.
+func (r *run) heldByDialog(els desktop.Elements, target *desktop.WindowID, app, title string) bool {
+	front, err := els.FrontWindow()
+	if errors.Is(err, desktop.ErrNoWindow) {
+		return false
 	}
-	if target == nil {
-		return
+	return err != nil || r.dialogHolds(front, target, app, title)
+}
+
+// dialogHolds reports whether the window in front is a dialog that holds
+// the recorded window of app, titled title: a dialog of that application,
+// else of target's, the window a step would bring forward, else of the
+// step's own. Only its title makes the dialog the recorded window itself,
+// since target may be any window of the application when no title
+// matches. title is already substituted.
+func (r *run) dialogHolds(front desktop.Element, target *desktop.WindowID, app, title string) bool {
+	if front.Role != desktop.RoleDialog {
+		return false
 	}
-	// Already acting on the best window? Leave it; only raise when a better
-	// window than the one in front is open.
-	if front := r.driver.FocusedWindow(); front.Known() && front.Handle == target.Handle {
-		return
+	if title != "" && desktop.WindowMatches(front.Name, title) {
+		return false
 	}
-	if err := r.driver.Raise(*target); err != nil {
-		return
+	if app == "" && target != nil {
+		app = target.App
 	}
-	logAction(r.timeline, index, fmt.Sprintf("bringing %q to the front", target.Title))
-	_ = sleep(ctx, foregroundSettle)
+	app = cmp.Or(app, r.workApp)
+	return app == "" || front.App == "" || strings.EqualFold(front.App, app)
+}
+
+// describeDialog says which dialog is in front and the text it shows, so
+// a step that stops on a dialog it was not told about names it.
+func describeDialog(els desktop.Elements, dialog desktop.Element) string {
+	var texts []string
+	if outline, err := els.Outline(dialog, 0); err == nil {
+		for _, e := range outline {
+			if e.Role != desktop.RoleText {
+				continue
+			}
+			if text := cmp.Or(strings.TrimSpace(e.Name), strings.TrimSpace(e.Value)); text != "" {
+				texts = append(texts, text)
+			}
+		}
+	}
+	what := "a dialog"
+	if dialog.Name != "" {
+		what = fmt.Sprintf("the dialog %q", dialog.Name)
+	}
+	if len(texts) == 0 {
+		return what + " is in front"
+	}
+	return fmt.Sprintf("%s is in front, showing %s", what, agentstep.QuoteShort(strings.Join(texts, " ")))
 }
 
 // proveValue marks a typed field whose value, read back after the typing,
