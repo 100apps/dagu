@@ -160,10 +160,15 @@ jobs:
       - name: Check out code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      # The linter compiles export data for its GOOS, which the race and
+      # coverage builds of the test cache never hold, so each GOOS keeps a
+      # small cache of its own.
       - name: Set up Go
+        id: go
         uses: ./.github/actions/setup-go-cache
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-name: go-lint-${{ matrix.goos }}
 
       - name: Check formatting (go fmt)
         if: matrix.goos == 'linux'
@@ -197,6 +202,18 @@ jobs:
           install-mode: none
           args: --timeout=10m
 
+      - name: Trim Go caches
+        if: ${{ github.ref == 'refs/heads/main' }}
+        shell: bash
+        run: scripts/ci/trim-go-cache.sh
+
+      - name: Save Go caches
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go.outputs.cache-paths }}
+          key: ${{ steps.go.outputs.cache-key }}
+
   test-ubuntu:
     name: Test on ubuntu-latest (${{ matrix.suite }} ${{ matrix.shard }}/${{ matrix.shards }})
     needs: changes
@@ -210,9 +227,9 @@ jobs:
           - { suite: unit, shard: 1, shards: 3 }
           - { suite: unit, shard: 2, shards: 3 }
           - { suite: unit, shard: 3, shards: 3 }
-          - { suite: intg, shard: 1, shards: 3 }
-          - { suite: intg, shard: 2, shards: 3 }
-          - { suite: intg, shard: 3, shards: 3 }
+          # The integration suite runs about as long as a unit shard, so
+          # splitting it would only pay each job's setup again.
+          - { suite: intg, shard: 1, shards: 1 }
     steps:
       - name: Check out code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -282,6 +299,11 @@ jobs:
 
       # One shard saves the cache that every Go job restores; it compiles the
       # binary and nearly every package with the race detector and coverage.
+      - name: Trim Go caches
+        if: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'unit' && matrix.shard == 1 }}
+        shell: bash
+        run: scripts/ci/trim-go-cache.sh
+
       - name: Save Go caches
         if: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'unit' && matrix.shard == 1 }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -654,13 +676,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { suite: unit, shard: 1, shards: 3 }
-          - { suite: unit, shard: 2, shards: 3 }
-          - { suite: unit, shard: 3, shards: 3 }
-          - { suite: intg, shard: 1, shards: 4 }
-          - { suite: intg, shard: 2, shards: 4 }
-          - { suite: intg, shard: 3, shards: 4 }
-          - { suite: intg, shard: 4, shards: 4 }
+          - { suite: unit, shard: 1, shards: 2 }
+          - { suite: unit, shard: 2, shards: 2 }
+          - { suite: intg, shard: 1, shards: 2 }
+          - { suite: intg, shard: 2, shards: 2 }
     steps:
       - name: Check out code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -694,6 +713,11 @@ jobs:
             go test "${args[@]}" ${packages} || status=1
           done 3< "${RUNNER_TEMP}/go-test-plan.tsv"
           exit "${status}"
+
+      - name: Trim Go caches
+        if: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'unit' && matrix.shard == 1 }}
+        shell: bash
+        run: scripts/ci/trim-go-cache.sh
 
       - name: Save Go caches
         if: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'unit' && matrix.shard == 1 }}
