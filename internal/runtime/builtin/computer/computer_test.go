@@ -6,6 +6,7 @@ package computer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"io"
 	"os"
@@ -882,6 +883,75 @@ func TestPinnedActDirect(t *testing.T) {
 	replayed := run.execute(steps, nil)
 	require.NoError(t, replayed.err)
 	assert.Equal(t, []string{"invoke saveButton"}, run.backend.inputs())
+}
+
+// A pinned choice from a list box clicks the box open on the screen and
+// chooses the option through its own pattern: the open menu is drawn apart
+// from the window, where the option has no place a click could aim at.
+func TestPinnedOptionIsChosenThroughItsPattern(t *testing.T) {
+	t.Parallel()
+
+	run := elementRun(t)
+	box := desktop.PathStep{Role: desktop.RoleComboBox, Name: "支払方法", Index: 0}
+	run.elements.elements = append(run.elements.elements,
+		desktop.Element{Role: desktop.RoleComboBox, Name: "支払方法", ID: "methodBox", Bounds: image.Rect(190, 230, 390, 256), Path: []desktop.PathStep{box}},
+		desktop.Element{Role: desktop.RoleMenuItem, Name: "クレジット", Bounds: image.Rect(190, 230, 390, 235), Path: []desktop.PathStep{box, {Role: desktop.RoleMenuItem, Name: "クレジット", Index: 1}}},
+	)
+	const steps = `{"ai": "never", "do": [{"act": {"instruction": "Pay by credit", "recorded": {"windows": [{"click": {"role": "combo_box", "id": "methodBox"}}, {"click": {"role": "menu_item", "name": "クレジット"}}]}}}]}`
+	replayed := run.execute(steps, nil)
+	require.NoError(t, replayed.err)
+	assert.Equal(t, []string{"move 290,243", "left down #1", "invoke クレジット"}, run.backend.inputs())
+}
+
+// The keys a pattern sends, as choosing an option of Chromium's list box
+// does, are the step's own input: the next action does not wait for a
+// person to stop using the desktop.
+func TestPatternInputIsTheSteps(t *testing.T) {
+	t.Parallel()
+
+	run := elementRun(t)
+	run.elements.onApply = func(desktop.Element, desktop.Pattern, string) {
+		run.backend.mu.Lock()
+		run.backend.personInputAt = time.Now()
+		run.backend.mu.Unlock()
+	}
+	const steps = `{"ai": "never", "input": "direct", "idle": "1s", "do": [` +
+		`{"act": {"instruction": "Save", "recorded": {"windows": [{"click": {"role": "button", "id": "saveButton"}}]}}},` +
+		`{"act": {"instruction": "Save the payment", "recorded": {"windows": [{"click": {"role": "button", "id": "paymentSaveButton"}}]}}}]}`
+	replayed := run.execute(steps, nil)
+	require.NoError(t, replayed.err)
+	assert.NotContains(t, strings.Join(lifecycleMessages(replayed.exec.GetAgentSession()), "\n"), "Waiting until nobody")
+}
+
+// A pattern that may have acted counts as the step's input; one refused
+// before it acted does not, so a person's input just before it still holds
+// the step back.
+func TestApplyPatternCountsOnlyInputItMayHaveSent(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		err    error
+		counts bool
+	}{
+		{"done", nil, true},
+		{"failed after acting", errors.New("the menu stayed open after its option was chosen"), true},
+		{"not there", desktop.ErrNotFound, false},
+		{"disabled", desktop.ErrDisabled, false},
+		{"no such pattern", desktop.ErrNoPattern, false},
+		{"a read-only field", fmt.Errorf("%w: the field is read-only", desktop.ErrRefused), false},
+		{"nothing to expand", fmt.Errorf("%w: the element has nothing to expand", desktop.ErrRefused), false},
+	} {
+		els := newFakeElements()
+		if tc.err != nil {
+			els.failPattern("saveButton", tc.err)
+		}
+		save, err := els.Find(desktop.Selector{Role: desktop.RoleButton, ID: "saveButton"})
+		require.NoError(t, err)
+		r := &run{driver: desktop.New(newFakeBackend(800, 600))}
+		_ = r.applyPattern(els, save[0], desktop.PatternInvoke, "")
+		assert.Equal(t, tc.counts, !r.driver.InputSentAt().IsZero(), tc.name)
+	}
 }
 
 // A pinned step that misses fails under never, naming why, and clicks

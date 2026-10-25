@@ -408,6 +408,29 @@ func directInput(rec recordedAction) (desktop.Pattern, bool) {
 	return "", false
 }
 
+// applyPattern has an element perform a pattern. A pattern can send keys of
+// its own, as choosing an option of Chromium's list box does; they are the
+// step's input, so the desktop is not taken to be in a person's use. A
+// pattern refused before it acted sent nothing, so a person's input just
+// before it still counts.
+func (r *run) applyPattern(els desktop.Elements, e desktop.Element, pattern desktop.Pattern, value string) error {
+	err := els.Apply(e, pattern, value)
+	if err == nil || !desktop.Refused(err) {
+		r.driver.AssumeInputSent(time.Now())
+	}
+	return err
+}
+
+// choosesOption reports an option of a list box's menu, which is chosen
+// through its own pattern under either input: on macOS the menu showing it
+// is drawn apart from the window, so the option has no place there that a
+// click could aim at.
+func choosesOption(e desktop.Element) bool {
+	return e.Role == desktop.RoleMenuItem && slices.ContainsFunc(e.Path, func(step desktop.PathStep) bool {
+		return step.Role == desktop.RoleComboBox
+	})
+}
+
 // patternVerbs say what a pattern did, or could not do, to an element.
 var patternVerbs = map[desktop.Pattern]string{
 	desktop.PatternInvoke: "invoked", desktop.PatternToggle: "toggled", desktop.PatternSelect: "selected",
@@ -465,7 +488,7 @@ func (r *run) direct(ctx context.Context, index, position, total int, els deskto
 		if own, owned := r.elementOwner(found); owned {
 			return false, fmt.Sprintf("%s at turn %d of %d: %s", rec.Element.describe(), position+1, total, ownedMessage(own)), nil
 		}
-		err := els.Apply(found, pattern, value)
+		err := r.applyPattern(els, found, pattern, value)
 		switch {
 		case err == nil:
 			logAction(r.timeline, index, "replay by element: "+describeDirect(pattern, rec))
@@ -517,7 +540,7 @@ func (r *run) replayByElement(ctx context.Context, index, position, total int, t
 			if own, owned := r.elementOwner(found); owned {
 				return fmt.Sprintf("%s at turn %d of %d: %s", rec.Element.describe(), position+1, total, ownedMessage(own)), nil
 			}
-			if direct {
+			if direct || choosesOption(found) {
 				done, reason, err := r.direct(ctx, index, position, total, els, rec, found, findWithin)
 				if err != nil || reason != "" {
 					return reason, err
