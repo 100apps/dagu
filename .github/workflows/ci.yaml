@@ -146,39 +146,31 @@ jobs:
 
   # Lint Go code
   golint:
-    name: Go Linter (${{ matrix.goos }})
+    name: Go Linter
     needs: changes
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # Files behind //go:build windows or darwin are invisible to a linter
-        # running at the host GOOS, so each is linted in a job of its own.
-        goos: [linux, windows, darwin]
     steps:
       - name: Check out code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      # The linter compiles export data for its GOOS, which the race and
-      # coverage builds of the test cache never hold, so each GOOS keeps a
-      # small cache of its own.
+      # The linter compiles plain export data for each GOOS, which the race
+      # and coverage builds of the test cache never hold, so it keeps a small
+      # cache of its own.
       - name: Set up Go
         id: go
         uses: ./.github/actions/setup-go-cache
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache-name: go-lint-${{ matrix.goos }}
+          cache-name: go-lint
 
       - name: Check formatting (go fmt)
-        if: matrix.goos == 'linux'
         run: |
           go fmt ./...
           # Fail if formatting changed any files
           git diff --exit-code || (echo "Go files are not formatted. Please run 'make fmt'" && exit 1)
 
       - name: Check modernize (go fix)
-        if: matrix.goos == 'linux'
         run: |
           diff=$(go fix -embedlit=false -diff ./... 2>&1) || true
           if [ -n "$diff" ]; then
@@ -196,11 +188,24 @@ jobs:
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
-        env:
-          GOOS: ${{ matrix.goos }}
         with:
           install-mode: none
           args: --timeout=10m
+
+      # Files behind //go:build windows or darwin are invisible to a linter
+      # running for Linux, so the few packages that have such files are
+      # linted again for each of those systems.
+      - name: Run golangci-lint for Windows and macOS
+        run: |
+          status=0
+          for goos in windows darwin; do
+            packages="$(scripts/ci/goos-packages.sh "${goos}")"
+            [[ -n "${packages}" ]] || continue
+            echo "Linting $(wc -l <<< "${packages}") packages for ${goos}"
+            # shellcheck disable=SC2086 # packages is a newline-separated list.
+            GOOS="${goos}" golangci-lint run --timeout=10m ${packages} || status=1
+          done
+          exit "${status}"
 
       - name: Trim Go caches
         if: ${{ github.ref == 'refs/heads/main' }}
