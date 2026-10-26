@@ -439,9 +439,17 @@ func (l *ConfigLoader) loadCoreConfig(cfg *Config, def Definition) error {
 	if cfg.OpenCode.Executable == "" {
 		cfg.OpenCode.Executable = "opencode"
 	}
-	cfg.Browser = BrowserConfig{NoSandbox: !l.v.GetBool("browser.sandbox"), MaxOpen: l.v.GetInt("browser.max_open")}
+	cfg.Browser = BrowserConfig{
+		NoSandbox:   !l.v.GetBool("browser.sandbox"),
+		MaxOpen:     l.v.GetInt("browser.max_open"),
+		WriteGate:   strings.TrimSpace(l.v.GetString("browser.write_gate")),
+		WritePolicy: strings.TrimSpace(l.v.GetString("browser.write_policy")),
+	}
 	if cfg.Browser.MaxOpen < 0 {
 		return fmt.Errorf("browser.max_open must not be negative, got %d", cfg.Browser.MaxOpen)
+	}
+	if mode := cfg.Browser.WriteGate; mode != "" && !slices.Contains(BrowserWriteGateModes, mode) {
+		return fmt.Errorf("browser.write_gate must be one of %s, got %q", strings.Join(BrowserWriteGateModes, ", "), mode)
 	}
 	if l.v.IsSet("browser.guard_client_certificates") {
 		guard := l.v.GetBool("browser.guard_client_certificates")
@@ -2291,6 +2299,8 @@ var envBindings = []envBinding{
 	{key: "browser.sandbox", env: "BROWSER_SANDBOX"},
 	{key: "browser.max_open", env: "BROWSER_MAX_OPEN"},
 	{key: "browser.guard_client_certificates", env: "BROWSER_GUARD_CLIENT_CERTIFICATES"},
+	{key: "browser.write_gate", env: "BROWSER_WRITE_GATE"},
+	{key: "browser.write_policy", env: "BROWSER_WRITE_POLICY", isPath: true},
 
 	// Secrets
 	{key: "secrets.vault.address", env: "SECRETS_VAULT_ADDRESS"},

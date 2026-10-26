@@ -7789,6 +7789,11 @@
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
           "description": "Persistent profile name. Cookies and storage are kept across runs; runs sharing a profile wait for each other."
         },
+        "write_gate": {
+          "type": "string",
+          "enum": ["off", "rehearse"],
+          "description": "Write gate mode: rehearse blocks the writes the page sends (any request but GET, HEAD, or OPTIONS), except sign-ins the host's browser.write_policy lists, and reports what it would have sent; the step stops at the first blocked write of the work and ends partially succeeded. The browser runs in the stricter of this and the host's browser.write_gate, so a step can only tighten it."
+        },
         "client_certificates": {
           "type": "array",
           "items": { "$ref": "#/definitions/browserClientCertificate" },
