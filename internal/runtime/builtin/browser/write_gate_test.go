@@ -6,9 +6,11 @@ package browser
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/browserhost/writegate"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -240,4 +242,180 @@ func TestCancelledStepReportsItsWrites(t *testing.T) {
 	report := run.readReport()
 	require.Len(t, report.Writes, 1)
 	assert.Equal(t, blockedSave.Signature, report.Writes[0].Signature)
+}
+
+// commitPoints returns the commit points the test run's step keeps.
+func (r *testRun) commitPoints() []writegate.CommitPoint {
+	r.t.Helper()
+	points, err := writegate.NewCommitStore(filepath.Join(r.dataDir, "browser")).Load("orders", "shop")
+	require.NoError(r.t, err)
+	return points
+}
+
+const recordedSteps = `{
+	"url": "https://books.example.com/deals",
+	"browser": {"write_gate": "record"},
+	"do": [
+		{"act": "Click the Save button"},
+		{"act": "Click the Next button"}
+	]
+}`
+
+// saveKey is the commit point key of recordedSteps' first act.
+var saveKey = replayKey(0, "Click the Save button", "https://books.example.com/deals")
+
+// approve keeps point as an approved commit point of the test run's step.
+func (r *testRun) approve(point writegate.CommitPoint) {
+	r.t.Helper()
+	store := writegate.NewCommitStore(filepath.Join(r.dataDir, "browser"))
+	require.NoError(r.t, store.Note(r.t.Context(), "orders", "shop", point))
+	_, err := store.Approve(r.t.Context(), "orders", "shop", nil, func(writegate.CommitPoint) bool { return true }, time.Now())
+	require.NoError(r.t, err)
+}
+
+// In record mode an approved commit act replays what was approved, asking
+// no model, while the gate lets it send its approved writes.
+func TestRecordSendsTheApprovedCommitWrite(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t, pageModel(nil))
+	run.engine.handle.WriteGate = runningGate()
+	saved := recordedAction{Selector: "xpath=/html/body/button[2]", Method: "click"}
+	actions, err := json.Marshal([]recordedAction{saved})
+	require.NoError(t, err)
+	run.approve(writegate.CommitPoint{Key: saveKey, Op: 0, Operation: "Click the Save button", Signature: blockedSave.Signature, Actions: actions})
+
+	execution := run.execute(recordedSteps, nil)
+	require.NoError(t, execution.err)
+
+	assert.Equal(t, [][]string{{blockedSave.Signature}}, run.engine.allowed, "only the commit act may send, and only its write")
+	assert.False(t, run.engine.allowing, "the allowance ends before the next operation")
+	assert.Equal(t, []recordedAction{saved}, run.engine.replays)
+	assert.Equal(t, []string{"Click the Next button"}, run.engine.actInstructions(), "the commit act asks no model")
+}
+
+// In record mode a write no approved commit point sends is blocked and
+// fails the step with write_blocked, and the act is kept as a commit point
+// to approve.
+func TestRecordFailsAWriteNothingApproved(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t, pageModel(nil))
+	run.engine.handle.WriteGate = runningGate()
+	run.engine.actWrites = []writegate.Event{blockedSave}
+	execution := run.execute(recordedSteps, nil)
+
+	require.ErrorContains(t, execution.err, "do[0] act failed: write_blocked: the write gate blocked POST https://books.example.com/api/deals")
+	assert.Equal(t, []string{"Click the Save button"}, run.engine.actInstructions())
+	points := run.commitPoints()
+	require.Len(t, points, 1)
+	assert.False(t, points[0].Approved)
+	assert.Equal(t, saveKey, points[0].Key)
+	assert.Equal(t, blockedSave.Signature, points[0].Signature)
+	assert.NotEmpty(t, points[0].Actions)
+	data, err := os.ReadFile(filepath.Join(run.artifacts, "browser", "shop", writeGateFile))
+	require.NoError(t, err)
+	var report writeGateReport
+	require.NoError(t, json.Unmarshal(data, &report))
+	require.NotNil(t, report.WouldSend)
+	assert.Equal(t, blockedSave.Signature, report.WouldSend.Signature)
+}
+
+// A rehearsal keeps the act it stopped at as a commit point.
+func TestRehearsalKeepsItsCommitPoint(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t, pageModel(nil))
+	run.engine.handle.WriteGate = runningGate()
+	run.engine.actWrites = []writegate.Event{blockedSave}
+	execution := run.execute(`{"url": "https://books.example.com/deals", "browser": {"write_gate": "rehearse"}, "do": [{"act": "Click the Save button"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	points := run.commitPoints()
+	require.Len(t, points, 1)
+	assert.Equal(t, "Click the Save button", points[0].Operation)
+	assert.Equal(t, "https://books.example.com/deals", points[0].Page)
+}
+
+// In record mode a write nothing approved, sent while the last downloads
+// settle, fails the step as one sent during an operation does.
+func TestRecordFailsAWriteAfterTheLastOperation(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t, pageModel(nil))
+	run.engine.handle.WriteGate = runningGate()
+	run.engine.downloadWrites = []writegate.Event{blockedSave}
+	execution := run.execute(`{"url": "https://books.example.com/deals", "browser": {"write_gate": "record"}, "do": [{"act": "Click the Save button"}]}`, nil)
+
+	require.ErrorContains(t, execution.err, "do[0] act failed: write_blocked")
+	require.Len(t, run.commitPoints(), 1)
+}
+
+// The approved write a commit act's page sends while the last downloads
+// settle is sent, as one sent during the act is.
+func TestRecordSendsAnApprovedWriteAfterTheLastOperation(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t, pageModel(nil))
+	run.engine.handle.WriteGate = runningGate()
+	run.approve(writegate.CommitPoint{Key: saveKey, Operation: "Click the Save button", Signature: blockedSave.Signature})
+	run.engine.downloadWrites = []writegate.Event{blockedSave}
+	execution := run.execute(`{"url": "https://books.example.com/deals", "browser": {"write_gate": "record"}, "do": [{"act": "Click the Save button"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	writes := run.readReport().Writes
+	require.Len(t, writes, 1)
+	assert.Equal(t, writegate.OutcomeSent, writes[0].Outcome)
+}
+
+// A write the page sends after an operation returned, before the next one
+// starts, is that operation's.
+func TestRecordKeepsALateWriteWithItsOperation(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t, pageModel(nil))
+	run.engine.handle.WriteGate = runningGate()
+	run.engine.downloadWrites = []writegate.Event{blockedSave}
+	execution := run.execute(recordedSteps, nil)
+
+	require.ErrorContains(t, execution.err, "do[0] act failed: write_blocked")
+	assert.Equal(t, []string{"Click the Save button"}, run.engine.actInstructions(), "the next operation does not start")
+	points := run.commitPoints()
+	require.Len(t, points, 1)
+	assert.Equal(t, saveKey, points[0].Key)
+}
+
+// A write sent while the last downloads settle, after the last operation
+// was skipped, is kept with the operation that ran.
+func TestRehearsalKeepsALateWriteWithTheOperationThatRan(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t, pageModel(nil))
+	run.engine.handle.WriteGate = runningGate()
+	run.engine.downloadWrites = []writegate.Event{blockedSave}
+	execution := run.execute(`{"url": "https://books.example.com/deals", "browser": {"write_gate": "rehearse"}, "do": [
+		{"act": "Click the Save button"},
+		{"act": "Close the banner", "when": {"text": "Cookies"}}
+	]}`, nil)
+	require.NoError(t, execution.err)
+
+	points := run.commitPoints()
+	require.Len(t, points, 1)
+	assert.Equal(t, 0, points[0].Op)
+	assert.Equal(t, "Click the Save button", points[0].Operation)
+}
+
+// A gate that may still let an operation's approved writes through fails
+// the step before the next operation starts.
+func TestRecordFailsWhenAnAllowanceMayNotEnd(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t, pageModel(nil))
+	run.engine.handle.WriteGate = runningGate()
+	run.approve(writegate.CommitPoint{Key: saveKey, Operation: "Click the Save button", Signature: blockedSave.Signature})
+	run.engine.endErr = errors.New("the write gate answered 500 Internal Server Error")
+	execution := run.execute(recordedSteps, nil)
+
+	require.ErrorContains(t, execution.err, "the write gate answered 500 Internal Server Error")
+	assert.Equal(t, []string{"Click the Save button"}, run.engine.actInstructions(), "the next operation does not start")
 }

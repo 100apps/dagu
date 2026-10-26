@@ -41,7 +41,7 @@ const ledgerPage = `<!doctype html><html><head><title>Ledger</title></head><body
 <button onclick="navigator.sendBeacon('/beacon', 'x'); say('beacon sent')">Send beacon</button>
 <button onclick="socket()">Open socket</button>
 <button onclick="signIn()">Sign in</button>
-<button onclick="setTimeout(() => post('/api/autosave', 'draft=1', 'application/x-www-form-urlencoded'), 1500)">Autosave later</button>
+<button onclick="setTimeout(() => post('/api/autosave', 'draft=1', 'application/x-www-form-urlencoded'), 4000)">Autosave later</button>
 <button onclick="post('/Default.aspx', '__EVENTTARGET=ctl00%24Save&amount=1', 'application/x-www-form-urlencoded')">Postback</button>
 <button onclick="post('/graphql', JSON.stringify({operationName: 'CreateEntry', query: 'mutation CreateEntry { id }'}), 'application/json')">Create with GraphQL</button>
 <button onclick="sync()">Sync later</button>
@@ -310,8 +310,10 @@ func TestSessionReportsAWriteMadeWhileIdle(t *testing.T) {
 
 	g := newGateEnv(t)
 	opened := g.open("--write-gate", "rehearse")
+	// The autosave comes after the click's downloads settled, while the
+	// session waits.
 	g.press(opened.ID, "Autosave later")
-	time.Sleep(3 * time.Second)
+	time.Sleep(4 * time.Second)
 	sent, _ := g.ledger.written()
 	assert.Empty(t, sent)
 
@@ -398,4 +400,44 @@ func TestSessionGateKillClosesTheBrowser(t *testing.T) {
 	after := decode(t, g.session(`{"wait": {"duration": "1ms"}}`, "do", opened.ID))
 	require.NotNil(t, after.Error, "the session cannot run another command: %+v", after)
 	assert.Equal(t, "session_ended", after.Error.Code)
+}
+
+// A session whose gate records blocks a write until the command that sends
+// it allows its signature, and the step it exports keeps that write as a
+// commit point to approve.
+func TestSessionRecordSendsAnAllowedWrite(t *testing.T) {
+	t.Parallel()
+
+	g := newGateEnv(t)
+	opened := g.open("--write-gate", "record")
+	assert.Equal(t, "record", opened.WriteGate)
+	save := fmt.Sprintf(`{"click": %q}`, g.find(opened.ID, "Save entry"))
+
+	blocked := g.session(save, "do", opened.ID)
+	blocked.ExpectNonZeroExitCode()
+	refused := decode(t, blocked)
+	require.NotNil(t, refused.Error)
+	assert.Equal(t, "write_blocked", refused.Error.Code)
+	require.Len(t, refused.Writes, 1)
+	signature := refused.Writes[0].Signature
+	sent, _ := g.ledger.written()
+	assert.Empty(t, sent)
+
+	allowed := g.session(save, "do", opened.ID, "--allow-write", signature)
+	allowed.ExpectExitCode(0)
+	approved := byPath(decode(t, allowed).Writes)["/api/entries"]
+	assert.Equal(t, "approved sent", approved.Class+" "+approved.Outcome)
+	sent, _ = g.ledger.written()
+	assert.Equal(t, map[string]int{"/api/entries": 1}, sent)
+
+	exported := g.session("", "export", opened.ID, "--dag", "books", "--step", "enter")
+	exported.ExpectExitCode(0)
+	var export struct {
+		CommitPoints int `json:"commit_points"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(exported.Stdout()), &export), exported.Stdout())
+	assert.Equal(t, 1, export.CommitPoints)
+	listed := g.dagu.RunWithEnv(g.env, "browser", "writes", "list", "books")
+	listed.ExpectExitCode(0)
+	assert.Contains(t, listed.Stdout(), signature)
 }
