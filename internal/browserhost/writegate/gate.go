@@ -538,6 +538,8 @@ func (g *gate) describe(req request, class string) Event {
 
 // answered keeps a sent write with the answer it got, paused at the
 // response stage, and lets the answer through as soon as its body is read.
+// As with a blocked write, the event is kept before the page gets the
+// answer.
 func (g *gate) answered(sessionID string, p pausedRequest) {
 	key := sessionID + "\x00" + p.RequestID
 	g.mu.Lock()
