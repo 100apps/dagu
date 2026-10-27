@@ -2274,6 +2274,55 @@ func TestReplayFocusesRecordedField(t *testing.T) {
 	assert.Equal(t, []string{"move 327,163", "left down #1", "focus amountBox", "type 12,000"}, run.backend.inputs())
 }
 
+// The model is told what a visible placeholder stands for, so it can find or
+// choose the value on the screen, as an item in a list; a value that is not
+// visible, such as a password, it never sees.
+func TestActShowsTheModelVisibleValues(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t)
+	run.sessions = []*scriptedSession{{turns: []*computeruse.Turn{done("Chose the item")}}}
+	execution := run.execute(`{"idle": "0", "variables": {"item": "Toner T-20", "password": "s3cret"}, "visible": ["item"], "do": [{"act": "Sign in with %password% and choose %item%"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	require.Len(t, run.sessionOptions, 1)
+	assert.Contains(t, run.sessionOptions[0].System, `%item% is "Toner T-20"`)
+	assert.NotContains(t, run.sessionOptions[0].System, "s3cret")
+
+	// A declared secret is never made visible, even one too short to look
+	// for inside text.
+	run.secrets = map[string]string{"PORTAL_PASSWORD": "s3cret", "DOOR_PIN": "123"}
+	refused := run.execute(`{"variables": {"password": "my s3cret"}, "visible": ["password"], "do": [{"act": "Sign in with %password%"}]}`, nil)
+	require.ErrorContains(t, refused.err, "with.variables.password contains the value of secret PORTAL_PASSWORD")
+	refused = run.execute(`{"variables": {"pin": "door 123"}, "visible": ["pin"], "do": [{"act": "Enter %pin%"}]}`, nil)
+	require.ErrorContains(t, refused.err, "with.variables.pin contains the value of secret DOOR_PIN")
+	assert.Len(t, run.sessionOptions, 1, "no model was asked")
+}
+
+// A visible value the model chooses is recorded by its placeholder however
+// short it is, and without the element's own id, so the next run chooses its
+// own value from the same list.
+func TestReplayRecordsAShortVisibleChoiceByPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	grade := func(name string, row int) desktop.Element {
+		top := 420 + 30*row
+		return desktop.Element{Role: desktop.RoleListItem, Name: name, ID: "grade-" + name, Bounds: image.Rect(120, top, 300, top+24), Path: []desktop.PathStep{{Role: desktop.RoleListItem, Name: name, Index: row}}}
+	}
+	run := elementRun(t)
+	run.elements.elements = append(expenseElements(), grade("A", 0), grade("B", 1))
+	run.sessions = []*scriptedSession{{turns: []*computeruse.Turn{actions(clickAt(210, 432)), done("Chose the grade")}}}
+	require.NoError(t, run.execute(`{"variables": {"grade": "A"}, "visible": ["grade"], "do": [{"act": "Choose %grade%"}]}`, nil).err)
+	recorded := lookupRecording(t, run, "Choose %grade%").Turns[0].Actions[0].Element.Selector
+	assert.Equal(t, desktop.Selector{Role: desktop.RoleListItem, Name: "%grade%"}, recorded)
+
+	run.backend.events = nil
+	replayed := run.execute(`{"variables": {"grade": "B"}, "visible": ["grade"], "do": [{"act": "Choose %grade%"}]}`, nil)
+	require.NoError(t, replayed.err)
+	assert.Equal(t, []string{"act:cache-hit"}, eventNames(replayed.exec.GetAgentSession()))
+	assert.Equal(t, []string{"move 210,462", "left down #1"}, run.backend.inputs(), "the replay clicks B, not the A it was recorded on")
+}
+
 // An element named by a variable's value is recorded by the placeholder,
 // so the next run, with another value, clicks the element named by it.
 func TestReplayRecordsPlaceholderForElementName(t *testing.T) {

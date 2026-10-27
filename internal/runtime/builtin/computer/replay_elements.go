@@ -68,8 +68,14 @@ func (r *run) recordElement(e desktop.Element, at *image.Point, app string) *rec
 	if e.Role == desktop.RoleWindow || e.Bounds.Empty() || (e.Name == "" && e.ID == "") {
 		return nil
 	}
+	// A name kept as a placeholder finds the element by the next run's
+	// value, which the element's own id would override.
+	name, id := r.elementName(e.Name), e.ID
+	if name != e.Name {
+		id = ""
+	}
 	rec := &recordedElement{
-		Selector: desktop.Selector{Role: e.Role, Name: r.placeholder(e.Name), ID: e.ID},
+		Selector: desktop.Selector{Role: e.Role, Name: name, ID: id},
 		Path:     e.Path,
 		App:      app,
 		Window:   r.placeholderIn(e.Window),
@@ -104,6 +110,21 @@ func (r *run) placeholder(text string) string {
 		}
 	}
 	return text
+}
+
+// elementName is the name a recording keeps for an element. A name that is
+// the value of a variable the model may see holds its placeholder however
+// short it is, since the model chose the element by that value; any other
+// name is kept as placeholder keeps it.
+func (r *run) elementName(name string) string {
+	if wanted := desktop.NormalizeText(name); wanted != "" {
+		for _, visible := range slices.Sorted(slices.Values(r.cfg.Visible)) {
+			if desktop.NormalizeText(r.variables[visible]) == wanted {
+				return "%" + visible + "%"
+			}
+		}
+	}
+	return r.placeholder(name)
 }
 
 // placeholderIn replaces every variable value text contains with its

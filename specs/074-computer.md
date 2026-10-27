@@ -258,6 +258,15 @@ text containing `%name%`, the value is typed instead. Values typed into fields
 that show them can appear in later screenshots, which are sent to the model
 and saved as artifacts.
 
+`with.visible` lists variables whose values the model may see, for values
+that are not secret: the model is told what each one stands for, so it can
+find or choose it on the screen, such as an item in a list a row chooses
+from. It still types the placeholder, and an element it chose by such a
+value is recorded by the placeholder (see Recordings), so the next run
+chooses its own value. A name in `with.visible` must be in
+`with.variables`, and the step fails before operating the desktop when a
+visible value holds a declared secret's value, however short.
+
 The step fails before operating the desktop when an `act`, `extract`, `ask`,
 `expect`, or `when` text contains the resolved value of a secret declared
 under `secrets:` that has four or more characters. Declared secret values and
@@ -323,11 +332,16 @@ chose on it, and the recordings are kept when the step succeeds. Beside the
 pixels of each action, a recording keeps the element the action landed on,
 or typed into, when the host can read elements (see Elements): its role,
 its name or id, its path in the window, and where in it the pointer went.
-An element with neither a name nor an id is recorded by its pixels alone.
-A name or a typed text equal to a variable's value or an `ask` answer of
-two or more characters is recorded as the `%name%` placeholder, and a
-window title containing such a value likewise, so a recording made on one
-record replays on the next. The recording keeps the application of the
+An element with neither a name nor an id is recorded by its pixels alone. A
+name or a typed text equal to a variable's value or an `ask` answer of two
+or more characters is recorded as the `%name%` placeholder, and so is a
+name equal to a `with.visible` value however short, since the model chose
+the element by it; an element recorded by a placeholder is recorded without
+its id, which would find the recorded element again. In a window title,
+each such value of two or more characters is replaced by its placeholder
+likewise, so a recording made on one record replays on the next; a shorter
+value stays as it is there, since one character would match parts of the
+title that are not the value. The recording keeps the application of the
 window the act ran on — the process image name — which a replay matches on,
 and each window's title only to tell apart several windows of one
 application and as a fallback when the application cannot be read. The
