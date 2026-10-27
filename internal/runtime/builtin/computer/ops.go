@@ -349,6 +349,8 @@ func (r *run) runOperation(ctx context.Context, index int, op operation) error {
 		return r.wait(ctx, index, op.Wait)
 	case op.Screenshot != "":
 		return r.screenshot(ctx, index, op.Screenshot)
+	case op.Outline != "":
+		return r.outline(ctx, index, op.Outline, timeout)
 	}
 	return fmt.Errorf("unsupported operation %q", op.kind())
 }
@@ -847,7 +849,9 @@ func (r *run) fail(ctx context.Context, index int, kind string, cause error) err
 		cause = ctx.Err()
 	}
 	var files []string
-	if r.cfg.screenshotPolicy() != screenshotsNever && r.artifacts.Enabled() && r.driver != nil {
+	// A window an outline refused to read is not captured either.
+	_, refused := errors.AsType[refusedWindow](cause)
+	if !refused && r.cfg.screenshotPolicy() != screenshotsNever && r.artifacts.Enabled() && r.driver != nil {
 		if rel, err := r.capture(context.WithoutCancel(ctx), failureShotLabel); err == nil {
 			files = append(files, rel)
 		}

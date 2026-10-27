@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -32,8 +33,13 @@ const (
 	opExpect     = "expect"
 	opWait       = "wait"
 	opScreenshot = "screenshot"
+	opOutline    = "outline"
 	opAsk        = "ask"
 )
+
+// outlineNamePattern is what an outline's output may be named: a step's
+// declared outputs start with a letter.
+var outlineNamePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
 
 // Automatic screenshot policies.
 const (
@@ -122,6 +128,7 @@ type operation struct {
 	Expect     *condition   `json:"expect,omitempty"`
 	Wait       string       `json:"wait,omitempty"`
 	Screenshot string       `json:"screenshot,omitempty"`
+	Outline    string       `json:"outline,omitempty"`
 	Ask        *askSpec     `json:"ask,omitempty"`
 	When       *condition   `json:"when,omitempty"`
 	Timeout    string       `json:"timeout,omitempty"`
@@ -141,7 +148,7 @@ func (o operation) maximize() *bool {
 // looksAtScreen reports an operation that reads or acts on the screen, or
 // checks it before running, which the front window is maximized for.
 func (o operation) looksAtScreen() bool {
-	return o.Act != nil || o.Extract != nil || (o.Expect != nil && !o.Expect.onValue()) || o.Screenshot != "" || (o.When != nil && !o.When.onValue())
+	return o.Act != nil || o.Extract != nil || (o.Expect != nil && !o.Expect.onValue()) || o.Screenshot != "" || o.Outline != "" || (o.When != nil && !o.When.onValue())
 }
 
 type launchSpec struct {
@@ -239,6 +246,8 @@ func (o operation) kind() string {
 		return opWait
 	case o.Screenshot != "":
 		return opScreenshot
+	case o.Outline != "":
+		return opOutline
 	case o.Ask != nil:
 		return opAsk
 	default:
@@ -289,6 +298,8 @@ func (o operation) subject() string {
 		return o.Wait
 	case o.Screenshot != "":
 		return o.Screenshot
+	case o.Outline != "":
+		return o.Outline
 	case o.Ask != nil:
 		return o.Ask.Prompt
 	}
@@ -595,10 +606,16 @@ func (c config) validate() error {
 			properties, _ := op.Extract.Schema["properties"].(map[string]any)
 			for name := range properties {
 				if first, exists := outputs[name]; exists {
-					return fmt.Errorf("computer: do[%d]: output %q is already extracted by do[%d]", i, name, first)
+					return fmt.Errorf("computer: do[%d]: output %q is already published by do[%d]", i, name, first)
 				}
 				outputs[name] = i
 			}
+		}
+		if op.Outline != "" {
+			if first, exists := outputs[op.Outline]; exists {
+				return fmt.Errorf("computer: do[%d]: output %q is already published by do[%d]", i, op.Outline, first)
+			}
+			outputs[op.Outline] = i
 		}
 		if op.Ask != nil {
 			if _, exists := c.Variables[op.Ask.As]; exists {
@@ -641,7 +658,7 @@ func (c config) validateChoice(o operation) error {
 
 func (o operation) validate() error {
 	if o.kind() == "" {
-		return errors.New("operation must set one of launch, act, extract, expect, wait, screenshot, or ask")
+		return errors.New("operation must set one of launch, act, extract, expect, wait, screenshot, outline, or ask")
 	}
 	if err := agentstep.ValidateDuration("timeout", o.Timeout); err != nil {
 		return err
@@ -687,6 +704,10 @@ func (o operation) validate() error {
 	case o.Screenshot != "":
 		if !agentstep.FileNamePattern.MatchString(o.Screenshot) {
 			return fmt.Errorf("screenshot name %q must match %s", o.Screenshot, agentstep.FileNamePattern)
+		}
+	case o.Outline != "":
+		if !outlineNamePattern.MatchString(o.Outline) {
+			return fmt.Errorf("outline name %q must match %s", o.Outline, outlineNamePattern)
 		}
 	case o.Ask != nil:
 		if strings.TrimSpace(o.Ask.Prompt) == "" {
@@ -971,6 +992,7 @@ var operationSchema = &jsonschema.Schema{
 		opExpect:     conditionSchema(),
 		opWait:       agentstep.NonEmptyString(),
 		opScreenshot: agentstep.NonEmptyString(),
+		opOutline:    agentstep.NonEmptyString(),
 		opAsk: {
 			Type:                 "object",
 			AdditionalProperties: agentstep.NoExtraProperties(),
@@ -991,6 +1013,7 @@ var operationSchema = &jsonschema.Schema{
 		{Required: []string{opExpect}},
 		{Required: []string{opWait}},
 		{Required: []string{opScreenshot}},
+		{Required: []string{opOutline}},
 		{Required: []string{opAsk}},
 	},
 }
