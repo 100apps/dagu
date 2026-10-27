@@ -9,6 +9,7 @@ import (
 	"image/draw"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/computerhost"
 	"github.com/dagucloud/dagu/v2/internal/desktop"
@@ -184,6 +185,109 @@ func TestWhenOnDataDecidesBeforeTheWindowIsFitted(t *testing.T) {
 			assert.Len(t, run.backend.maximizedWindows(), tc.maximized)
 		})
 	}
+}
+
+// A launch returns before the application it opens comes to the front, so
+// the operation after it waits for that application rather than fit the
+// window a person had in front.
+func TestFitsTheLaunchedApplication(t *testing.T) {
+	t.Parallel()
+
+	terminal := desktop.WindowID{Handle: 3, Title: "zsh", App: "Terminal", Bounds: image.Rect(0, 0, 400, 300)}
+	for _, tc := range []struct {
+		name, launch string
+		// front is the window in front as the launch begins.
+		front desktop.WindowID
+	}{
+		{"an app by name", `{"command": "open", "args": ["-a", "Report"]}`, terminal},
+		{"a program", `"C:\\Apps\\report.exe"`, terminal},
+		{"an app already in front", `{"command": "open", "args": ["-a", "Report"]}`, reportWindow},
+		{"an app by its path already in front", `{"command": "open", "args": ["-a", "/Applications/Report.app"]}`, reportWindow},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			run := windowRun(t, reportWindow.Bounds)
+			run.backend.focusOn(tc.front)
+			run.onLaunch = func() {
+				go func() {
+					time.Sleep(200 * time.Millisecond)
+					run.backend.focusOn(reportWindow)
+				}()
+			}
+			execution := run.execute(`{"ai": "never", "do": [{"launch": `+tc.launch+`}, {"screenshot": "opened"}]}`, nil)
+			require.NoError(t, execution.err)
+			require.Len(t, run.backend.maximizedWindows(), 1)
+			assert.Equal(t, reportWindow.Handle, run.backend.maximizedWindows()[0].Handle, "the launched application's window, not the terminal")
+			assert.NotContains(t, execution.stderr.String(), "came to the front", "no wait runs out")
+		})
+	}
+}
+
+// The app a launch opened is the one the step works in: when a person
+// brings another app forward before the next check, the launched app comes
+// back once they stop. Another app that took the front before the launched
+// one is not the step's, and never comes back.
+func TestALaunchedAppComesBackAfterAPerson(t *testing.T) {
+	t.Parallel()
+
+	form := expenseWindow()
+	expense := desktop.WindowID{Handle: 2, Title: form.Name, App: "expense"}
+	notes := desktop.WindowID{Handle: 1, Title: "メモ", App: "notes"}
+	call := desktop.WindowID{Handle: 3, Title: "着信", App: "FaceTime"}
+	for _, tc := range []struct {
+		name string
+		// first is the window that comes forward after the launch.
+		first desktop.WindowID
+		// raised is the window brought back, if any.
+		raised []uint64
+	}{
+		{"the launched app", expense, []uint64{expense.Handle}},
+		{"another app first", call, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			run := elementRun(t)
+			run.backend.windows = []desktop.WindowID{notes, expense, call}
+			run.backend.focusOn(notes)
+			run.elements.asApp(notes.App)
+			run.elements.retitle(notes.Title)
+			run.elements.arriveAfter(0, []desktop.Element{})
+			run.onLaunch = func() {
+				// A window comes forward for a moment; then a person brings
+				// their notes back in front.
+				run.backend.mu.Lock()
+				run.backend.focusNext = []desktop.WindowID{tc.first}
+				run.backend.mu.Unlock()
+				run.backend.personUses()
+			}
+			run.backend.onRaise = func(w desktop.WindowID) {
+				if w.Handle == expense.Handle {
+					run.elements.asApp(expense.App)
+					run.elements.retitle(expense.Title)
+					run.elements.arriveAfter(0, expenseElements())
+				}
+			}
+			execution := run.execute(`{"ai": "never", "idle": "100ms", "maximize": false, "do": [{"launch": "C:\\Apps\\expense.exe"}, {"expect": {"text": "保存しました"}, "timeout": "1s"}]}`, nil)
+			var raised []uint64
+			for _, w := range run.backend.raised {
+				raised = append(raised, w.Handle)
+			}
+			assert.Equal(t, tc.raised, raised)
+			if tc.raised != nil {
+				require.NoError(t, execution.err, "the launched app came back")
+			}
+		})
+	}
+}
+
+// A launch waits no longer than its own timeout for what it opened.
+func TestALaunchWaitsNoLongerThanItsTimeout(t *testing.T) {
+	t.Parallel()
+
+	run := windowRun(t, reportWindow.Bounds)
+	execution := run.execute(`{"ai": "never", "maximize": false, "do": [{"launch": {"command": "open", "args": ["-a", "Ledger"]}, "timeout": "200ms"}]}`, nil)
+	require.NoError(t, execution.err)
+	assert.Contains(t, execution.stderr.String(), "nothing it opened came to the front within 200ms")
 }
 
 func TestMaximizesTheFrontWindow(t *testing.T) {
