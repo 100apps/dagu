@@ -359,7 +359,7 @@ steps:
 `))
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "registry.path is required")
+	assert.Contains(t, err.Error(), "registry.path: path is required")
 }
 
 func TestLoadDAGToolsRejectsLocalRegistryRelativePath(t *testing.T) {
@@ -379,7 +379,7 @@ steps:
 `))
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "registry.path must be an absolute path")
+	assert.Contains(t, err.Error(), "registry.path: path must be an absolute path")
 }
 
 func TestLoadDAGToolsRejectsFloatingLatestVersion(t *testing.T) {

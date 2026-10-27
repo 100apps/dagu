@@ -20,8 +20,8 @@ import (
 
 // A subprocess bounds the regression: opening a FIFO before stat would hang.
 func TestToolsetHashFIFO(t *testing.T) {
-	if len(os.Args) >= 3 && os.Args[len(os.Args)-2] == "--hash-fifo" {
-		_, err := ToolsetHash(&ir.ToolConfig{Registry: &ir.ToolRegistry{Type: "local", Path: os.Args[len(os.Args)-1]}}, "linux/amd64")
+	if path := os.Getenv("DAGU_TEST_HASH_FIFO"); path != "" {
+		_, _, err := ToolsetHash(&ir.ToolConfig{Registry: &ir.ToolRegistry{Type: "local", Path: path}}, "linux/amd64")
 		require.ErrorContains(t, err, "not a regular file")
 		return
 	}
@@ -31,14 +31,16 @@ func TestToolsetHashFIFO(t *testing.T) {
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, binary, "-test.run=^TestToolsetHashFIFO$", "--", "--hash-fifo", path).CombinedOutput()
+	cmd := exec.CommandContext(ctx, binary, "-test.run=^TestToolsetHashFIFO$")
+	cmd.Env = append(os.Environ(), "DAGU_TEST_HASH_FIFO="+path)
+	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, "%s", output)
 }
 
 func TestToolsetHashDevice(t *testing.T) {
 	for _, path := range []string{"/dev/null", "/dev/zero"} {
 		t.Run(path, func(t *testing.T) {
-			_, err := ToolsetHash(&ir.ToolConfig{Registry: &ir.ToolRegistry{Type: "local", Path: path}}, "linux/amd64")
+			_, _, err := ToolsetHash(&ir.ToolConfig{Registry: &ir.ToolRegistry{Type: "local", Path: path}}, "linux/amd64")
 			require.ErrorContains(t, err, "not a regular file")
 		})
 	}
@@ -50,6 +52,6 @@ func TestToolsetHashSymlink(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("packages: []"), 0o600))
 	link := path + ".link"
 	require.NoError(t, os.Symlink(path, link))
-	_, err := ToolsetHash(&ir.ToolConfig{Registry: &ir.ToolRegistry{Type: "local", Path: link}}, "linux/amd64")
+	_, _, err := ToolsetHash(&ir.ToolConfig{Registry: &ir.ToolRegistry{Type: "local", Path: link}}, "linux/amd64")
 	require.NoError(t, err)
 }

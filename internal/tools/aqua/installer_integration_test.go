@@ -15,11 +15,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/tools"
+	"github.com/goccy/go-yaml"
 	"github.com/stretchr/testify/require"
 )
 
@@ -166,13 +168,46 @@ func TestInstallerLocalRegistryIntegration(t *testing.T) {
 		artifact.Store(artifacts[reply])
 		registry := fmt.Sprintf("# revision: %s\npackages:\n  - name: example/tool\n    type: http\n    url: http://registry.test/%s\n    format: raw\n    files:\n      - name: %s\n", reply, command, command)
 		require.NoError(t, os.WriteFile(path, []byte(registry), 0o600))
-		client := &http.Client{Transport: localRegistryTransport{host: server.Listener.Addr().String()}}
-		manifest, err := New(WithHTTPClient(client), WithLogger(slog.New(slog.NewTextHandler(os.Stderr, nil)))).Install(t.Context(), cfg, opts)
+		expectedHash, _, err := tools.ToolsetHash(effectiveToolConfig(cfg), runtime.GOOS+"/"+runtime.GOARCH)
 		require.NoError(t, err)
+		// Change the source after hashing but before the install finishes. Every
+		// aqua controller must use the captured bytes, even across repeated reads.
+		var edit sync.Once
+		var editErr error
+		client := &http.Client{Transport: localRegistryTransport{
+			host: server.Listener.Addr().String(),
+			onArtifact: func() error {
+				edit.Do(func() { editErr = os.WriteFile(path, []byte("packages: ["), 0o600) })
+				return editErr
+			},
+		}}
+		installer := New(WithHTTPClient(client), WithLogger(slog.New(slog.NewTextHandler(os.Stderr, nil))))
+		manifest, err := installer.Install(t.Context(), cfg, opts)
+		require.NoError(t, err)
+		require.Equal(t, expectedHash, manifest.Hash)
+		configBytes, err := os.ReadFile(manifest.Config)
+		require.NoError(t, err)
+		var aquaCfg configFile
+		require.NoError(t, yaml.Unmarshal(configBytes, &aquaCfg))
+		require.Len(t, aquaCfg.Registries, 1)
+		snapshot := aquaCfg.Registries[0].Path
+		require.NotEqual(t, path, snapshot)
+		require.True(t, filepath.IsAbs(snapshot))
+		snapshotBytes, err := os.ReadFile(snapshot)
+		require.NoError(t, err)
+		require.Equal(t, registry, string(snapshotBytes))
+		sourceBytes, err := os.ReadFile(path)
+		require.NoError(t, err)
+		require.Equal(t, "packages: [", string(sourceBytes))
+		require.Equal(t, path, cfg.Registry.Path)
 		require.FileExists(t, manifest.Checksum)
 		output, err := exec.CommandContext(t.Context(), manifest.Commands[command].Path).CombinedOutput()
 		require.NoError(t, err, "%s", output)
 		require.Equal(t, reply, string(output))
+		require.NoError(t, os.WriteFile(path, []byte(registry), 0o600))
+		cached, err := installer.Install(t.Context(), cfg, opts)
+		require.NoError(t, err)
+		require.Equal(t, manifest, cached)
 		if previous != nil {
 			require.NotEqual(t, previous.Hash, manifest.Hash)
 			require.NotEqual(t, previous.RootDir, manifest.RootDir)
@@ -182,10 +217,18 @@ func TestInstallerLocalRegistryIntegration(t *testing.T) {
 }
 
 // Aqua includes the URL host in cache paths; a port would make them invalid on Windows.
-type localRegistryTransport struct{ host string }
+type localRegistryTransport struct {
+	host       string
+	onArtifact func() error
+}
 
 func (r localRegistryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Host == "registry.test" {
+		if r.onArtifact != nil {
+			if err := r.onArtifact(); err != nil {
+				return nil, err
+			}
+		}
 		req = req.Clone(req.Context())
 		req.URL.Host = r.host
 	}

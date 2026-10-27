@@ -143,7 +143,11 @@ func (i *Installer) installResolved(ctx context.Context, cfg *ir.ToolConfig, opt
 	if platform == "" {
 		platform = rt.Env()
 	}
-	hash, err := tools.ToolsetHash(cfg, platform)
+	local := cfg.Registry != nil && strings.TrimSpace(cfg.Registry.Type) == "local"
+	if local && !filepath.IsAbs(strings.TrimSpace(cfg.Registry.Path)) {
+		return nil, fmt.Errorf("registry.path %q is not absolute for worker %s", cfg.Registry.Path, rt.Env())
+	}
+	hash, snapshot, err := tools.ToolsetHash(cfg, platform)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +190,21 @@ func (i *Installer) installResolved(ctx context.Context, cfg *ir.ToolConfig, opt
 	if err := os.MkdirAll(paths.RootDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create aqua root dir: %w", err)
 	}
-	data, err := RenderConfigForPlatform(cfg, platform)
+	renderCfg := cfg
+	if local {
+		registry := *cfg.Registry
+		registry.Path, err = filepath.Abs(filepath.Join(paths.EnvDir, "registry.yaml"))
+		if err != nil {
+			return nil, fmt.Errorf("resolve local registry snapshot path: %w", err)
+		}
+		if err := fileutil.WriteFileAtomic(registry.Path, snapshot, 0o600); err != nil {
+			return nil, fmt.Errorf("write local registry snapshot: %w", err)
+		}
+		copyCfg := *cfg
+		copyCfg.Registry = &registry
+		renderCfg = &copyCfg
+	}
+	data, err := RenderConfigForPlatform(renderCfg, platform)
 	if err != nil {
 		return nil, err
 	}

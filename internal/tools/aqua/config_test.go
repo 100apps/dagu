@@ -111,7 +111,7 @@ func TestRenderConfigRejectsLocalRegistryWithoutPath(t *testing.T) {
 	}, "linux/amd64")
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "registry.path is required")
+	assert.Contains(t, err.Error(), "registry.path: path is required")
 }
 
 func TestEffectiveToolConfigDeepCopiesPackageCommands(t *testing.T) {

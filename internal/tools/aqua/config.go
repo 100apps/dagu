@@ -169,7 +169,7 @@ func renderRegistry(registry *ir.ToolRegistry) (registryEntry, error) {
 	case "local":
 		path := strings.TrimSpace(registry.Path)
 		if err := ir.ValidateWorkerAbsPath(path); err != nil {
-			return registryEntry{}, fmt.Errorf("registry.%w", err)
+			return registryEntry{}, fmt.Errorf("registry.path: %w", err)
 		}
 		return registryEntry{
 			Name: emptyDefault(strings.TrimSpace(registry.Name), "local"),
