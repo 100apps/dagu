@@ -85,6 +85,8 @@ $DAGU_HOME/
 
 - A project directory has the same layout as `DAGU_HOME`, without
   `config.yaml`.
+- `dag_discovery` settings in `config.yaml` apply to every project's DAG
+  directory, as they do to the default project.
 - `paths.projects_dir` sets where projects live. The default is
   `$DAGU_HOME/projects`, or the XDG data directory when `DAGU_HOME` is unset.
 - The default project is the existing home. Its paths, including any set in
