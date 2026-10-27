@@ -31,9 +31,19 @@ const (
 	stillPixels = 256
 )
 
+// protectedTitlesEnv lists window titles, separated by commas and matched
+// as a window title is anywhere else, whose windows a step never operates or
+// maximizes, such as the automation's own pages in a browser.
+const protectedTitlesEnv = "DAGU_DESKTOP_PROTECTED_TITLES"
+
 // protectedApps reads the applications a step never operates.
 func protectedApps() []string {
 	return strings.Split(os.Getenv(protectedAppsEnv), ",")
+}
+
+// protectedTitles reads the window titles a step never operates.
+func protectedTitles() []string {
+	return strings.Split(os.Getenv(protectedTitlesEnv), ",")
 }
 
 // recordedWindow is the application window a pixel turn was recorded on.
@@ -235,8 +245,12 @@ func (r *run) elementOwner(e desktop.Element) (desktop.WindowID, bool) {
 	return desktop.WindowID{}, false
 }
 
-// ownedMessage says why the step will not operate a window.
-func ownedMessage(w desktop.WindowID) string {
+// ownedMessage says why the step will not operate a window: it belongs to
+// the application that runs the step, or shows one of its pages.
+func (r *run) ownedMessage(w desktop.WindowID) string {
+	if r.driver.OwnedPage(w) {
+		return fmt.Sprintf("%s is a page of the application that runs this step, which it never operates", describeWindow(w))
+	}
 	return fmt.Sprintf("%q belongs to the application that runs this step, which it never operates", w.Title)
 }
 

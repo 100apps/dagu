@@ -2817,8 +2817,8 @@ func TestOwnApplicationIsNeverOperated(t *testing.T) {
 
 	run := newTestRun(t)
 	run.protect = []uint32{99}
-	run.backend.focusOn(desktop.WindowID{Handle: 5, Title: "Kitewell", PID: 99})
-	run.backend.under = desktop.WindowID{Handle: 5, Title: "Kitewell", PID: 99}
+	run.backend.focusOn(desktop.WindowID{Handle: 5, Title: "Runbook", PID: 99})
+	run.backend.under = desktop.WindowID{Handle: 5, Title: "Runbook", PID: 99}
 	session := &scriptedSession{turns: []*computeruse.Turn{
 		actions(computeruse.Action{CallID: "k", Kind: computeruse.KindKey, Keys: []string{"alt", "F4"}}),
 		actions(clickAt(10, 10)),
@@ -2830,18 +2830,19 @@ func TestOwnApplicationIsNeverOperated(t *testing.T) {
 
 	assert.Empty(t, run.backend.inputs(), "nothing reached the desktop")
 	require.Len(t, session.observations, 3)
-	assert.Contains(t, session.observations[1].Results[0].Error, `"Kitewell" belongs to the application that runs this step`)
+	assert.Contains(t, session.observations[1].Results[0].Error, `"Runbook" belongs to the application that runs this step`)
 	assert.Contains(t, session.observations[2].Results[0].Error, "never operates")
 }
 
 // The own-application guard covers every window an action reaches: the
-// window under the cursor for a button press that moves nothing, a later
-// point a drag crosses, and the focused window for a click that holds a
-// modifier while the pointer is elsewhere.
+// window under the cursor for a button press that moves nothing and for a
+// click or scroll that names no position, a later point a drag crosses, and
+// the focused window for a click that holds a modifier while the pointer is
+// elsewhere.
 func TestOwnApplicationGuardCoversEveryReach(t *testing.T) {
 	t.Parallel()
 
-	own := desktop.WindowID{Handle: 5, Title: "Kitewell", PID: 99}
+	own := desktop.WindowID{Handle: 5, Title: "Runbook", PID: 99}
 	other := desktop.WindowID{Handle: 6, Title: "Notepad", PID: 7}
 
 	cases := []struct {
@@ -2853,6 +2854,16 @@ func TestOwnApplicationGuardCoversEveryReach(t *testing.T) {
 			name:  "button press at the cursor over an owned window",
 			setup: func(b *fakeBackend) { b.under = own },
 			turn:  actions(computeruse.Action{CallID: "a", Kind: computeruse.KindMouseDown, Button: "left"}),
+		},
+		{
+			name:  "a click without a position at the cursor over an owned window",
+			setup: func(b *fakeBackend) { b.under = own },
+			turn:  actions(computeruse.Action{CallID: "a", Kind: computeruse.KindClick, Button: "left"}),
+		},
+		{
+			name:  "a scroll without a position at the cursor over an owned window",
+			setup: func(b *fakeBackend) { b.under = own },
+			turn:  actions(computeruse.Action{CallID: "a", Kind: computeruse.KindScroll, ScrollY: 3}),
 		},
 		{
 			name: "a drag crosses an owned window after its first point",
@@ -2885,6 +2896,30 @@ func TestOwnApplicationGuardCoversEveryReach(t *testing.T) {
 			assert.Empty(t, run.backend.inputs(), "nothing reached the desktop")
 			require.GreaterOrEqual(t, len(session.observations), 2)
 			assert.Contains(t, session.observations[1].Results[0].Error, "never operates")
+		})
+	}
+}
+
+// An action at the cursor is refused when the cursor's position cannot be
+// read, since the window it would reach is unknown.
+func TestActionAtAnUnreadableCursorIsRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, action := range []computeruse.Action{
+		{CallID: "a", Kind: computeruse.KindClick, Button: "left"},
+		{CallID: "a", Kind: computeruse.KindScroll, ScrollY: 3},
+		{CallID: "a", Kind: computeruse.KindMouseDown, Button: "left"},
+	} {
+		t.Run(string(action.Kind), func(t *testing.T) {
+			t.Parallel()
+			run := newTestRun(t)
+			run.backend.positionErr = errors.New("no pointer")
+			session := &scriptedSession{turns: []*computeruse.Turn{actions(action), done("Gave up")}}
+			run.sessions = []*scriptedSession{session}
+			require.NoError(t, run.execute(`{"idle": "0", "do": [{"act": "Operate"}]}`, nil).err)
+			assert.Empty(t, run.backend.inputs(), "nothing reached the desktop")
+			require.GreaterOrEqual(t, len(session.observations), 2)
+			assert.Contains(t, session.observations[1].Results[0].Error, "the pointer's position cannot be read")
 		})
 	}
 }

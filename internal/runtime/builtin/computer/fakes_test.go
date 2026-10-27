@@ -40,8 +40,9 @@ type fakeBackend struct {
 	afterClicks []*image.RGBA
 	afterWheels []*image.RGBA
 	events      []string
-	// typeErr fails typing when set.
-	typeErr error
+	// typeErr fails typing, and positionErr reading the pointer's
+	// position, when set.
+	typeErr, positionErr error
 	// lastEvent and personInputAt are when the desktop last received input
 	// from the step and from a person.
 	lastEvent     time.Time
@@ -508,7 +509,7 @@ func (b *fakeBackend) MoveTo(x, y int) error {
 	return nil
 }
 
-func (b *fakeBackend) Position() (int, int, error) { return 0, 0, nil }
+func (b *fakeBackend) Position() (int, int, error) { return 0, 0, b.positionErr }
 
 func (b *fakeBackend) Button(button desktop.Button, down bool, clicks int) error {
 	if !down {
@@ -787,11 +788,12 @@ type testRun struct {
 	// parent, when set, is the context the step runs under, so a test can
 	// cancel it.
 	parent context.Context
-	// protect names processes, and protectApps applications, whose windows
-	// the step must not operate.
-	protect     []uint32
-	protectApps []string
-	launches    [][]string
+	// protect names processes, protectApps applications, and protectTitles
+	// window titles, whose windows the step must not operate.
+	protect       []uint32
+	protectApps   []string
+	protectTitles []string
+	launches      [][]string
 	// remote runs the step as if in a remote desktop session rather than
 	// at the console, where it does not wait for a person by default.
 	remote bool
@@ -874,6 +876,7 @@ func (r *testRun) execute(withJSON string, session *ir.AgentSession) *stepExecut
 		return r.elements, nil
 	}
 	execution.exec.protectedApps = r.protectApps
+	execution.exec.protectedTitles = r.protectTitles
 	// A replay looks once for what it needs, so a miss is quick; a test
 	// that wants waiting sets find_within.
 	execution.exec.findWithin = 0

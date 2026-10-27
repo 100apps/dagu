@@ -280,8 +280,8 @@ func TestModelElementInAProtectedWindowIsRefused(t *testing.T) {
 
 	run := newTestRun(t)
 	run.elements = newFakeElements()
-	run.backend.app = "Kitewell"
-	run.protectApps = []string{"kitewell"}
+	run.backend.app = "Runbook"
+	run.protectApps = []string{"runbook"}
 	session := &scriptedSession{turns: []*computeruse.Turn{
 		actions(computeruse.Action{CallID: "x", Kind: computeruse.KindClick, ElementID: "e1"}),
 		done("Could not save"),
@@ -293,6 +293,27 @@ func TestModelElementInAProtectedWindowIsRefused(t *testing.T) {
 	require.Len(t, session.observations, 2)
 	require.Len(t, session.observations[1].Results, 1)
 	assert.Contains(t, session.observations[1].Results[0].Error, "belongs to the application that runs this step")
+}
+
+// A window whose title is protected, such as the automation's own page in a
+// browser a person also uses, is never operated: a click the model aims
+// there is refused, and the model is told why.
+func TestModelClickOnAProtectedTitleIsRefused(t *testing.T) {
+	t.Parallel()
+
+	page := desktop.WindowID{Handle: 4, Title: "Batches · Runbook", PID: 31, App: "Google Chrome", Bounds: image.Rect(0, 0, 400, 200)}
+	run := newTestRun(t)
+	run.backend.windows = []desktop.WindowID{page}
+	run.backend.under = page
+	run.protectTitles = []string{"· Runbook"}
+	session := &scriptedSession{turns: []*computeruse.Turn{actions(clickAt(10, 10)), done("Could not run")}}
+	run.sessions = []*scriptedSession{session}
+	require.NoError(t, run.execute(`{"idle": "0", "do": [{"act": "Run the sheet"}]}`, nil).err)
+
+	assert.Empty(t, run.backend.inputs(), "the click does not reach the page")
+	require.Len(t, session.observations, 2)
+	require.Len(t, session.observations[1].Results, 1)
+	assert.Contains(t, session.observations[1].Results[0].Error, `Google Chrome "Batches · Runbook" is a page of the application that runs this step`)
 }
 
 // A replay never has an element in a window the step never operates act by
@@ -323,12 +344,12 @@ func TestDirectReplayRechecksTheWindowBeforeEachTry(t *testing.T) {
 	run.sessions = []*scriptedSession{{turns: []*computeruse.Turn{actions(clickAt(235, 194)), done("Saved")}}}
 	require.NoError(t, run.execute(steps, nil).err)
 
-	run.protectApps = []string{"Kitewell"}
+	run.protectApps = []string{"Runbook"}
 	run.elements.failPattern("saveButton", desktop.ErrDisabled)
 	// The first try finds the button disabled; by the next, the protected
 	// window is in front and the button is enabled.
 	run.elements.onRefuse = func(desktop.Element, desktop.Pattern, error) {
-		run.backend.focusOn(desktop.WindowID{Handle: 9, Title: "Kitewell", PID: 77, App: "Kitewell"})
+		run.backend.focusOn(desktop.WindowID{Handle: 9, Title: "Runbook", PID: 77, App: "Runbook"})
 		run.elements.mu.Lock()
 		delete(run.elements.applyErr, "saveButton")
 		run.elements.mu.Unlock()
