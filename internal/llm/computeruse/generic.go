@@ -41,6 +41,10 @@ const (
 	// conversation; older ones are replaced with a note to bound its size.
 	keptScreenshots   = 3
 	omittedScreenshot = "(An earlier screenshot was removed from the conversation.)"
+	// elementsHeader begins a screen's element list, and omittedElements
+	// stands in for one an earlier screen had.
+	elementsHeader  = "\nElements you can target with click_element by id:"
+	omittedElements = "(This screen's element list was removed; only the latest list's ids can be targeted.)"
 )
 
 // genericImageLimit fits the image limits of common vision models.
@@ -59,6 +63,15 @@ type genericSession struct {
 	// pending are the tool calls of the last turn, which the next
 	// observation must answer.
 	pending []pendingCall
+	// list is where the latest screen's element list begins, so the next
+	// screen removes that list and nothing else, such as a task that
+	// quotes its header; nil when no list is kept.
+	list *listStart
+}
+
+// listStart is the message an element list is in and the byte it starts at.
+type listStart struct {
+	message, at int
 }
 
 // pendingCall is a tool call awaiting its result. err is set when the call
@@ -159,10 +172,15 @@ func (s *genericSession) appendObservation(obs Observation) {
 		text.WriteString(obs.Note + "\n\n")
 	}
 	fmt.Fprintf(&text, "Current screen (%dx%d pixels).", obs.Screen.Width, obs.Screen.Height)
+	s.dropOldElements()
 	if len(obs.Elements) > 0 {
-		text.WriteString("\nElements you can target with click_element by id:")
+		s.list = &listStart{message: len(s.messages), at: text.Len()}
+		text.WriteString(elementsHeader)
 		for _, e := range obs.Elements {
 			fmt.Fprintf(&text, "\n- %s: %s %q", e.ID, e.Role, e.Name)
+			if e.Value != "" {
+				fmt.Fprintf(&text, " value %q", e.Value)
+			}
 		}
 	}
 	s.dropOldScreenshots()
@@ -171,6 +189,18 @@ func (s *genericSession) appendObservation(obs Observation) {
 		Content: text.String(),
 		Images:  []llm.Image{obs.Screen.Image},
 	})
+}
+
+// dropOldElements removes the element lists of earlier screens, whose ids
+// only the latest list names now, so the conversation does not carry every
+// list again.
+func (s *genericSession) dropOldElements() {
+	if s.list == nil {
+		return
+	}
+	message := &s.messages[s.list.message]
+	message.Content = message.Content[:s.list.at] + "\n" + omittedElements
+	s.list = nil
 }
 
 // dropOldScreenshots removes images from all but the latest screenshots,
