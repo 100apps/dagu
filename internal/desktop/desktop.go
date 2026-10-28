@@ -73,6 +73,13 @@ type Backend interface {
 	// Windows lists the visible top-level windows, the front of the
 	// Z-order first. It is empty where the system does not enumerate them.
 	Windows() []WindowID
+	// ReachableWindows lists every visible top-level window a pointer
+	// action can land in, the front of the Z-order first: those Windows
+	// lists, and the untitled ones and those of menus, status items, the
+	// Dock or the taskbar it leaves out, but not a menu bar the front
+	// application draws in. It is empty where the system does not
+	// enumerate them.
+	ReachableWindows() []WindowID
 	// Raise brings a window to the foreground. It is a best effort: the
 	// system may refuse a foreground change asked by a background process.
 	Raise(w WindowID) error
@@ -203,6 +210,8 @@ type Driver struct {
 	// protectedTitles are window titles the driver never operates, such as
 	// the automation's own pages in a browser a person also uses.
 	protectedTitles []string
+	// held are the buttons PressButton pressed and nothing released since.
+	held []Button
 }
 
 // New returns a driver for a backend.
@@ -232,6 +241,10 @@ func (d *Driver) WindowAt(at image.Point) WindowID { return d.backend.WindowAt(a
 // Windows lists the visible top-level windows, the front of the Z-order
 // first, so a step can find one to bring forward.
 func (d *Driver) Windows() []WindowID { return d.backend.Windows() }
+
+// ReachableWindows lists every visible window a pointer action can land in,
+// the front first.
+func (d *Driver) ReachableWindows() []WindowID { return d.backend.ReachableWindows() }
 
 // Raise brings a window to the foreground, a best effort.
 func (d *Driver) Raise(w WindowID) error { return d.backend.Raise(w) }
@@ -349,9 +362,9 @@ func (d *Driver) WaitForIdle(ctx context.Context, idle, poll time.Duration, onWa
 	return nil
 }
 
-// Close releases the driver.
+// Close releases the driver, and every button still pressed.
 func (d *Driver) Close() error {
-	return d.backend.Close()
+	return errors.Join(d.ReleaseHeld(), d.backend.Close())
 }
 
 // Screenshot captures the primary display.
@@ -402,14 +415,38 @@ func (d *Driver) Click(ctx context.Context, at *image.Point, button Button, coun
 	})
 }
 
-// PressButton presses a button at the pointer.
+// PressButton presses a button at the pointer, which stays pressed until
+// ReleaseButton or ReleaseHeld releases it.
 func (d *Driver) PressButton(button Button) error {
-	return d.backend.Button(button, true, 1)
+	if err := d.backend.Button(button, true, 1); err != nil {
+		return err
+	}
+	if !slices.Contains(d.held, button) {
+		d.held = append(d.held, button)
+	}
+	return nil
 }
 
 // ReleaseButton releases a button at the pointer.
 func (d *Driver) ReleaseButton(button Button) error {
-	return d.backend.Button(button, false, 1)
+	if err := d.backend.Button(button, false, 1); err != nil {
+		return err
+	}
+	d.held = slices.DeleteFunc(d.held, func(b Button) bool { return b == button })
+	return nil
+}
+
+// ReleaseHeld releases, at the pointer, every button PressButton pressed
+// and nothing has released since. A button whose release fails stays
+// pressed for the next ReleaseHeld.
+func (d *Driver) ReleaseHeld() error {
+	var errs []error
+	d.held = slices.DeleteFunc(d.held, func(button Button) bool {
+		err := d.backend.Button(button, false, 1)
+		errs = append(errs, err)
+		return err == nil
+	})
+	return errors.Join(errs...)
 }
 
 // Drag holds the left button from the first point of a path to the last,

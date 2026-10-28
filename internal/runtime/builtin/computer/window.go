@@ -208,7 +208,9 @@ const (
 // forward, is then the one the step works in; another application that
 // took the front first is not. A host that did not say which window was in
 // front before, or a launch whose window never comes to the front, goes on
-// as it is.
+// as it is. A launch naming none that brings forward a window the step
+// never operates, such as another application's a person had open, does
+// not make that application one the step works in.
 func (r *run) awaitLaunched(ctx context.Context, index int, spec launchSpec, before desktop.WindowID, wait time.Duration) error {
 	if !before.Known() {
 		return nil
@@ -219,6 +221,9 @@ func (r *run) awaitLaunched(ctx context.Context, index int, spec launchSpec, bef
 		w := r.driver.FocusedWindow()
 		named := app != "" && strings.EqualFold(w.App, app)
 		if w.Known() && (named || w.Handle != before.Handle) {
+			if (named && !r.driver.Owned(w)) || (app == "" && !r.offLimits(w)) {
+				r.trustWorkApp(w.App)
+			}
 			if named || app == "" {
 				r.noteWorkApp(w)
 			}
@@ -269,20 +274,20 @@ func (r *run) fit(ctx context.Context, index int) error {
 // fits reports a window fit has yet to try: one the system names, that the
 // step may operate, and that this attempt has not tried.
 func (r *run) fits(w desktop.WindowID) bool {
-	return w.Known() && !r.driver.Owned(w) && !r.fitted[w.Handle]
+	return w.Known() && !r.offLimits(w) && !r.fitted[w.Handle]
 }
 
-// elementOwner reports a window the step never operates that an action on
-// an element would reach: the window under the element's centre, where the
-// elements reader finds the element first, or the window in front, where it
-// looks for the element next.
-func (r *run) elementOwner(e desktop.Element) (desktop.WindowID, bool) {
+// elementOffLimits reports a window the step never operates that an action
+// on an element would reach: the window under the element's centre, where
+// the elements reader finds the element first, or the window in front,
+// where it looks for the element next.
+func (r *run) elementOffLimits(e desktop.Element) (desktop.WindowID, bool) {
 	if !e.Bounds.Empty() {
-		if w := r.driver.WindowAt(elementCentre(e)); r.driver.Owned(w) {
+		if w := r.driver.WindowAt(elementCentre(e)); r.offLimits(w) {
 			return w, true
 		}
 	}
-	if w := r.driver.FocusedWindow(); r.driver.Owned(w) {
+	if w := r.driver.FocusedWindow(); r.offLimits(w) {
 		return w, true
 	}
 	return desktop.WindowID{}, false
