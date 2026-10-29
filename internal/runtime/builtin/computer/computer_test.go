@@ -1081,11 +1081,15 @@ func confirmDialog() (desktop.Element, []desktop.Element) {
 func TestHandlerClearsAScreenThatComesUpSometimes(t *testing.T) {
 	t.Parallel()
 
-	const steps = `{"ai": "never", "input": "direct", "find_within": "300ms",
+	// The step may look for an element, and the check wait, for a minute,
+	// far longer than any of these runs takes. A run that waited for the
+	// screen on either bound stands apart from one that did not, however
+	// slow the host.
+	const steps = `{"ai": "never", "input": "direct", "find_within": "1m",
 		"handle": [{"name": "入力中クリアの確認", "when": {"text": "クリアしていいですか"}, "recorded": {"windows": [{"click": {"role": "button", "name": "はい"}}]}}],
 		"do": [
 			{"act": {"instruction": "Reset", "recorded": {"windows": [{"click": {"role": "button", "id": "saveButton"}}]}}},
-			{"expect": {"element": {"role": "text_field", "id": "amountBox"}, "within": "2s"}}
+			{"expect": {"element": {"role": "text_field", "id": "amountBox"}, "within": "1m"}}
 		]}`
 	for _, tc := range []struct {
 		name      string
@@ -1126,7 +1130,7 @@ func TestHandlerClearsAScreenThatComesUpSometimes(t *testing.T) {
 			assert.Equal(t, tc.inputs, run.backend.inputs())
 			assert.Equal(t, tc.handled, strings.Contains(execution.stderr.String(), "handling 入力中クリアの確認"))
 			if !tc.handled {
-				assert.Less(t, time.Since(began), time.Second, "a run without the screen does not wait for it")
+				assert.Less(t, time.Since(began), 30*time.Second, "a run without the screen does not wait for it")
 			}
 		})
 	}
@@ -3683,6 +3687,183 @@ func TestRepeatedRoundIsNoted(t *testing.T) {
 	assert.Empty(t, session.observations[1].Note, "one round is not a repeat")
 	assert.Equal(t, repeatNote, session.observations[2].Note)
 	assert.Contains(t, execution.stderr.String(), "repeated its previous actions")
+}
+
+// A model that cycles through actions that leave the screen as it was, such
+// as clicking a field and selecting all in turn, is told so, then the act
+// ends instead of running to its timeout. A cycle whose actions change the
+// screen goes on.
+func TestStuckCycleEndsTheAct(t *testing.T) {
+	t.Parallel()
+
+	selectAll := keyPress("ctrl", "a")
+	cycle := []*computeruse.Turn{
+		actions(clickAt(5, 5)), actions(selectAll), actions(clickAt(5, 5)), actions(selectAll), actions(clickAt(5, 5)), done("Cleared the field"),
+	}
+
+	t.Run("still screen", func(t *testing.T) {
+		t.Parallel()
+		run := newTestRun(t)
+		session := &scriptedSession{turns: slices.Clone(cycle)}
+		run.sessions = []*scriptedSession{session}
+		execution := run.execute(`{"cache": false, "do": [{"act": "Clear the quantity"}]}`, nil)
+		require.ErrorContains(t, execution.err, "the model kept acting for 5 rounds without changing the screen")
+
+		notes, _ := session.requests()
+		assert.Equal(t, []string{"", "", "", stuckNote, stuckNote}, notes, "told whenever it repeats itself")
+		assert.Len(t, session.turns, 1, "the act ended before the model's report")
+	})
+
+	t.Run("changing screen", func(t *testing.T) {
+		t.Parallel()
+		run := newTestRun(t)
+		for shift := 1; shift <= 3; shift++ {
+			run.backend.afterClicks = append(run.backend.afterClicks, pattern(400, 200, shift*40))
+		}
+		session := &scriptedSession{turns: slices.Clone(cycle)}
+		run.sessions = []*scriptedSession{session}
+		execution := run.execute(`{"cache": false, "do": [{"act": "Clear the quantity"}]}`, nil)
+		require.NoError(t, execution.err)
+
+		notes, _ := session.requests()
+		assert.Equal(t, []string{"", "", "", "", "", ""}, notes)
+	})
+}
+
+// Actions an earlier failure skipped were never taken, so running them later
+// is no repeat.
+func TestSkippedActionsAreNotTried(t *testing.T) {
+	t.Parallel()
+
+	missing := computeruse.Action{CallID: "m", Kind: computeruse.KindClick, ElementID: "e9"}
+	selectAll, selectAllMac := keyPress("ctrl", "a"), keyPress("cmd", "a")
+	run := newTestRun(t)
+	session := &scriptedSession{turns: []*computeruse.Turn{
+		actions(missing, selectAll, selectAllMac), actions(selectAll), actions(selectAllMac), actions(selectAll), done("Selected the text"),
+	}}
+	run.sessions = []*scriptedSession{session}
+	execution := run.execute(`{"cache": false, "do": [{"act": "Select the text"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	notes, _ := session.requests()
+	assert.Equal(t, []string{"", "", "", "", stuckNote}, notes, "only the last round repeats an action that ran")
+}
+
+// A screen that changed while the model chose its next actions, which then
+// did not run, starts the count afresh.
+func TestChangedScreenResetsStuck(t *testing.T) {
+	t.Parallel()
+
+	selectAll := keyPress("ctrl", "a")
+	run := newTestRun(t)
+	requests := 0
+	session := &scriptedSession{
+		turns: []*computeruse.Turn{
+			actions(selectAll), actions(selectAll), actions(selectAll), actions(selectAll), actions(selectAll), done("Selected the text"),
+		},
+		onNext: func() {
+			if requests++; requests == 3 {
+				run.backend.show(pattern(400, 200, 120))
+			}
+		},
+	}
+	run.sessions = []*scriptedSession{session}
+	execution := run.execute(`{"cache": false, "do": [{"act": "Select the text"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	notes, _ := session.requests()
+	require.Len(t, notes, 6)
+	assert.Equal(t, divergedNote, notes[3], "the third round did not run")
+}
+
+// Rounds that only wait are not counted toward a stuck act, so a model may
+// wait for a slow application as long as the act lasts.
+func TestWaitingIsNotStuck(t *testing.T) {
+	t.Parallel()
+
+	wait := computeruse.Action{CallID: "w", Kind: computeruse.KindWait, Duration: time.Millisecond}
+	run := newTestRun(t)
+	session := &scriptedSession{turns: []*computeruse.Turn{
+		actions(wait), actions(wait), actions(wait), actions(wait), actions(wait), done("The report finished loading"),
+	}}
+	run.sessions = []*scriptedSession{session}
+	execution := run.execute(`{"cache": false, "do": [{"act": "Wait for the report"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	notes, _ := session.requests()
+	assert.NotContains(t, notes, stuckNote)
+}
+
+// Clicks on different elements are different actions, even where none
+// changes the screen much, as when ticking boxes one by one: none is a
+// repeat, and the act is not stuck.
+func TestDistinctElementsAreNotStuck(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t)
+	run.elements = newFakeElements()
+	run.elements.elements = append(run.elements.elements,
+		desktop.Element{Role: desktop.RoleCheckbox, Name: "請求書", Bounds: image.Rect(190, 220, 210, 240)},
+		desktop.Element{Role: desktop.RoleCheckbox, Name: "領収書", Bounds: image.Rect(190, 250, 210, 270)},
+	)
+	click := func(id string) computeruse.Action {
+		return computeruse.Action{CallID: id, Kind: computeruse.KindClick, ElementID: id}
+	}
+	session := &scriptedSession{turns: []*computeruse.Turn{
+		actions(click("e1")), actions(click("e2")), actions(click("e3")), actions(click("e4")), done("Clicked each"),
+	}}
+	run.sessions = []*scriptedSession{session}
+	execution := run.execute(`{"idle": "0", "cache": false, "do": [{"act": "Click each control"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	notes, _ := session.requests()
+	assert.Equal(t, []string{"", "", "", "", ""}, notes, "no round repeats another")
+}
+
+// Holding a key for different times is different actions.
+func TestDifferentHoldsAreNotStuck(t *testing.T) {
+	t.Parallel()
+
+	hold := func(d time.Duration) computeruse.Action {
+		return computeruse.Action{CallID: "h", Kind: computeruse.KindHoldKey, Keys: []string{"shift"}, Duration: d}
+	}
+	run := newTestRun(t)
+	session := &scriptedSession{turns: []*computeruse.Turn{
+		actions(hold(time.Millisecond)), actions(hold(2 * time.Millisecond)), actions(hold(3 * time.Millisecond)), actions(hold(4 * time.Millisecond)), done("Held shift"),
+	}}
+	run.sessions = []*scriptedSession{session}
+	execution := run.execute(`{"cache": false, "do": [{"act": "Hold shift"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	notes, _ := session.requests()
+	assert.NotContains(t, notes, stuckNote)
+}
+
+// An empty field is offered with the hint it shows, so the model can tell a
+// grey "0" from a value; a field that holds a value shows none.
+func TestOfferedFieldShowsItsHint(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t)
+	run.elements = newFakeElements()
+	run.elements.elements = append(run.elements.elements,
+		desktop.Element{Role: desktop.RoleTextField, Name: "数量", Placeholder: "0", Bounds: image.Rect(190, 220, 390, 244)},
+		desktop.Element{Role: desktop.RoleTextField, Name: "単価", Value: "300", Placeholder: "0", Bounds: image.Rect(190, 250, 390, 274)},
+	)
+	session := &scriptedSession{turns: []*computeruse.Turn{done("Looked at the form")}}
+	run.sessions = []*scriptedSession{session}
+	execution := run.execute(`{"idle": "0", "do": [{"act": "Look at the form"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	require.NotEmpty(t, session.observations)
+	offered := map[string]computeruse.Element{}
+	for _, e := range session.observations[0].Elements {
+		offered[e.Name] = e
+	}
+	assert.Equal(t, "0", offered["数量"].Hint)
+	assert.Empty(t, offered["数量"].Value)
+	assert.Equal(t, "300", offered["単価"].Value)
+	assert.Empty(t, offered["単価"].Hint, "a field that holds a value shows no hint")
 }
 
 // A scroll that moved nothing is reported at once, so the model scrolls
