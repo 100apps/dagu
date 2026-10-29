@@ -23,6 +23,10 @@ import (
 // task properly.
 const continueNote = "Continue the task. " + computeruse.DoneInstruction
 
+// reportNote asks a model that keeps answering without acting to report the
+// task with done, the only tool it is then offered.
+const reportNote = "You have not reported the task. Report it now: call done with success set to true if the task is complete, or false with what is wrong or left."
+
 // personNote tells a model why its actions were not run.
 const personNote = "A person used the computer after your last screenshot, so your last actions were not run. Continue the task from the current screen."
 
@@ -279,8 +283,9 @@ type actLoop struct {
 	elements []recordedElement
 	// choices maps the ids offered to the model this turn to the elements
 	// they name, so click_element resolves to a position.
-	choices  map[string]desktop.Element
-	reminded bool
+	choices map[string]desktop.Element
+	// stalled counts the model's answers in a row without an action.
+	stalled int
 	// capped records that the model was told the task has no actions left
 	// and asked for its report.
 	capped bool
@@ -335,11 +340,23 @@ func (l *actLoop) run(ctx context.Context) error {
 				return fmt.Errorf("the task needed more than max_actions (%d) actions", l.budget)
 			}
 			l.capped = true
+			// The model acted, though nothing ran, so its answers without an
+			// action are counted afresh.
+			l.stalled = 0
 			logAction(l.r.timeline, l.index, "the task has used the actions it may take; asking the model to report")
-			if l.seen, err = l.look(ctx); err != nil {
+			offered, err := l.lookAndOffer(ctx)
+			if err != nil {
 				return err
 			}
-			obs = computeruse.Observation{Screen: l.seen.forModel(), Results: skippedResults(turn.Actions), Note: capNote}
+			// Only a budget with nothing left takes the actions away; one
+			// that a batch overran may still fit a smaller one.
+			obs = computeruse.Observation{
+				Screen:     l.seen.forModel(),
+				Results:    skippedResults(turn.Actions),
+				Note:       capNote,
+				ReportOnly: l.exhausted(),
+				Elements:   offered,
+			}
 			continue
 		}
 		// Before running the turn's actions, make sure the world still matches
@@ -377,7 +394,7 @@ func (l *actLoop) run(ctx context.Context) error {
 		if verify && len(turn.Actions) == 0 {
 			return l.finish(ctx, turn)
 		}
-		note, err := l.reminder(turn)
+		note, reportOnly, err := l.reminder(turn)
 		if err != nil {
 			return err
 		}
@@ -416,6 +433,7 @@ func (l *actLoop) run(ctx context.Context) error {
 			Results:      results,
 			Acknowledged: turn.Confirmation != "",
 			Note:         note,
+			ReportOnly:   reportOnly,
 			Elements:     offered,
 		}
 	}
@@ -878,6 +896,11 @@ func (l *actLoop) admit(turn *computeruse.Turn) (over bool, err error) {
 	return l.spent+l.outcome.actions+len(turn.Actions) > l.budget, nil
 }
 
+// exhausted reports whether the task has no action left.
+func (l *actLoop) exhausted() bool {
+	return l.spent+l.outcome.actions >= l.budget
+}
+
 // onlyScrolls reports a turn that does nothing but scroll.
 func onlyScrolls(actions []computeruse.Action) bool {
 	for _, action := range actions {
@@ -1028,18 +1051,31 @@ func (l *actLoop) finish(ctx context.Context, turn *computeruse.Turn) error {
 	return nil
 }
 
-// reminder returns the note sent with the next screen. A model that twice
-// answers without acting or reporting the task done is stuck.
-func (l *actLoop) reminder(turn *computeruse.Turn) (string, error) {
+// reminder returns the note sent with the next screen, and whether it asks
+// for the model's report alone. A model that answers without acting or
+// reporting the task done is reminded to continue. A model that cannot be
+// forced to call a tool may end with text again, so it is then asked for its
+// report with nothing else to call; one that still does not report is stuck.
+// A model with no action left is not reminded to continue but asked for
+// its report alone at once.
+func (l *actLoop) reminder(turn *computeruse.Turn) (note string, reportOnly bool, err error) {
 	if len(turn.Actions) > 0 {
-		l.reminded = false
-		return "", nil
+		l.stalled = 0
+		return "", false, nil
 	}
-	if l.reminded {
-		return "", fmt.Errorf("the model stopped without reporting the task done: %s", agentstep.QuoteShort(turn.Text))
+	l.stalled++
+	if l.exhausted() {
+		l.stalled = max(l.stalled, 2)
 	}
-	l.reminded = true
-	return continueNote, nil
+	switch l.stalled {
+	case 1:
+		return continueNote, false, nil
+	case 2:
+		logAction(l.r.timeline, l.index, "the model answered without acting or reporting; asking it to report")
+		return reportNote, true, nil
+	default:
+		return "", false, fmt.Errorf("the model stopped without reporting the task done: %s", agentstep.QuoteShort(turn.Text))
+	}
 }
 
 func skippedResults(actions []computeruse.Action) []computeruse.Result {

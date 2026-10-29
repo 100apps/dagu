@@ -3510,9 +3510,11 @@ func TestActLimits(t *testing.T) {
 			want:  "the model could not complete the task: The file is missing",
 		},
 		{
+			// Reminded to continue, then asked for its report alone, a model
+			// that still answers without acting ends the act.
 			name:  "model stops without done",
 			with:  `{"do": [{"act": "Open the file"}]}`,
-			turns: []*computeruse.Turn{{Text: "I think it is open."}, {Text: "Still open."}},
+			turns: []*computeruse.Turn{{Text: "I think it is open."}, {Text: "Still open."}, {Text: "It is open."}},
 			want:  "the model stopped without reporting the task done",
 		},
 		{
@@ -3547,8 +3549,123 @@ func TestCapAsksForReport(t *testing.T) {
 	assert.Equal(t, []string{"move 1,1", "left down #1", "move 2,2", "left down #1"}, run.backend.inputs(), "the third click was not run")
 	require.Len(t, session.observations, 3)
 	assert.Equal(t, capNote, session.observations[2].Note)
+	assert.True(t, session.observations[2].ReportOnly)
 	assert.Equal(t, []computeruse.Result{{CallID: "c", Skipped: true}}, session.observations[2].Results)
 	assert.Contains(t, execution.stderr.String(), "Clicked around (2 actions)")
+}
+
+// A model that answers the request for its report after the cap with text
+// is asked for the report alone again, not offered actions it may not take.
+func TestCapAsksForReportAfterText(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t)
+	session := &scriptedSession{turns: []*computeruse.Turn{
+		actions(clickAt(1, 1), clickAt(2, 2)), actions(clickAt(3, 3)), said("I clicked around."), done("Clicked around"),
+	}}
+	run.sessions = []*scriptedSession{session}
+	execution := run.execute(`{"max_actions": 2, "cache": false, "do": [{"act": "Click around"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	notes, reportOnly := session.requests()
+	assert.Equal(t, []string{"", "", capNote, reportNote}, notes)
+	assert.Equal(t, []bool{false, false, true, true}, reportOnly)
+}
+
+// A batch larger than the actions left leaves the model its actions, so a
+// smaller one may still finish the task.
+func TestCapLeavesActionsThatRemain(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t)
+	session := &scriptedSession{turns: []*computeruse.Turn{
+		actions(clickAt(1, 1), clickAt(2, 2)), actions(clickAt(3, 3), clickAt(4, 4)), actions(clickAt(3, 3)), done("Clicked around"),
+	}}
+	run.sessions = []*scriptedSession{session}
+	execution := run.execute(`{"max_actions": 3, "cache": false, "do": [{"act": "Click around"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	assert.Equal(t, []string{"move 1,1", "left down #1", "move 2,2", "left down #1", "move 3,3", "left down #1"}, run.backend.inputs())
+	notes, reportOnly := session.requests()
+	assert.Equal(t, []string{"", "", capNote, ""}, notes)
+	assert.Equal(t, []bool{false, false, false, false}, reportOnly)
+}
+
+// A batch that overruns the actions left counts as an answer with actions,
+// so the model's answers without one are counted afresh, and with actions
+// left a text answer is reminded to continue before it is asked to report.
+func TestCapCountsTextAnswersAfresh(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t)
+	session := &scriptedSession{turns: []*computeruse.Turn{
+		said("Looking."), said("Still looking."), actions(clickAt(1, 1), clickAt(2, 2)), said("I would click twice."), said("Thinking."), said("I am stuck."),
+	}}
+	run.sessions = []*scriptedSession{session}
+	execution := run.execute(`{"max_actions": 1, "cache": false, "do": [{"act": "Click twice"}]}`, nil)
+	require.ErrorContains(t, execution.err, "the model stopped without reporting the task done")
+
+	notes, reportOnly := session.requests()
+	assert.Equal(t, []string{"", continueNote, reportNote, capNote, continueNote, reportNote}, notes)
+	assert.Equal(t, []bool{false, false, true, false, false, true}, reportOnly)
+}
+
+// The request for the report after the cap lists the screen's elements, so
+// the model judges its report from what the fields hold.
+func TestCapRequestListsElements(t *testing.T) {
+	t.Parallel()
+
+	run := newTestRun(t)
+	run.elements = newFakeElements()
+	session := &scriptedSession{turns: []*computeruse.Turn{actions(clickAt(1, 1), clickAt(2, 2)), done("Clicked around")}}
+	run.sessions = []*scriptedSession{session}
+	execution := run.execute(`{"idle": "0", "max_actions": 1, "cache": false, "do": [{"act": "Click around"}]}`, nil)
+	require.NoError(t, execution.err)
+
+	require.Len(t, session.observations, 2)
+	assert.Equal(t, capNote, session.observations[1].Note)
+	assert.Contains(t, session.observations[1].Elements, computeruse.Element{ID: "e1", Role: desktop.RoleButton, Name: "保存"})
+}
+
+// A model that cannot be forced to call a tool may end a task it did with
+// text instead of done. Answering a second time without acting, it is asked
+// for its report alone, so the act ends as the model reports it.
+func TestAnswersWithoutActingAskForReport(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		report *computeruse.Turn
+		// want is the act's error, empty when it succeeds.
+		want string
+	}{
+		{name: "done", report: done("Filled in the order")},
+		{
+			name:   "not done",
+			report: &computeruse.Turn{Done: &computeruse.Done{Success: false, Summary: "The quantity was not accepted"}},
+			want:   "the model could not complete the task: The quantity was not accepted",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			run := newTestRun(t)
+			session := &scriptedSession{turns: []*computeruse.Turn{
+				actions(clickAt(1, 1)), said("I filled in the order."), said("The order is filled in, not saved."), tc.report,
+			}}
+			run.sessions = []*scriptedSession{session}
+			execution := run.execute(`{"cache": false, "do": [{"act": "Fill in the order"}]}`, nil)
+			if tc.want != "" {
+				require.ErrorContains(t, execution.err, tc.want)
+			} else {
+				require.NoError(t, execution.err)
+				assert.Contains(t, execution.stderr.String(), "Filled in the order (1 actions)")
+			}
+
+			notes, reportOnly := session.requests()
+			assert.Equal(t, []string{"", "", continueNote, reportNote}, notes)
+			assert.Equal(t, []bool{false, false, false, true}, reportOnly, "the first reminder still lets the model act")
+		})
+	}
 }
 
 // A model that repeats its previous round on a screen that did not change is
