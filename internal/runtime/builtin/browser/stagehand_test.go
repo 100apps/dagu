@@ -744,6 +744,269 @@ func TestStagehandWaitsForTheFrameAPressLoads(t *testing.T) {
 	}
 }
 
+// serveWindowedSearch serves a site built of frames that opens windows as
+// older sites do. Search writes a "searching" window in place and posts
+// into the content frame, whose answer comes once answer returns, or the
+// server stops, and closes the window as it loads; Search for details opens a details window that
+// stays while it posts the same search. Choose region opens a window to tick
+// regions in, which stays until Register gives them to the menu and closes
+// it. Mark marks the menu.
+func serveWindowedSearch(t *testing.T, answer func(stopped context.Context)) string {
+	t.Helper()
+	stopped, stop := context.WithCancel(context.Background())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		switch r.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, `<script>
+function openSearching() {
+	top.searching = window.open("/blank", "searching", "width=320,height=120");
+	top.searching.document.write("<title>Searching</title><p>Searching, please wait</p><input name='indicator'>");
+	top.searching.document.close();
+}
+function closeSearching() { if (top.searching) top.searching.close(); }
+</script><frameset cols="200,*"><frame src="/menu"><frame name="main" src="/home"></frameset>`)
+		case "/menu":
+			_, _ = io.WriteString(w, `<form id="search" method="post" action="/results" target="main"></form>
+<p id="region">No region</p>
+<button onclick="top.openSearching(); document.getElementById('search').submit()">Search</button>
+<button onclick="window.open('/regions', 'regions', 'width=800,height=600')">Choose region</button>
+<button onclick="window.open('/details', 'details', 'width=800,height=600'); document.getElementById('search').submit()">Search for details</button>
+<button onclick="document.getElementById('region').textContent = 'Marked'">Mark</button>
+<script>function setRegion(name) { document.getElementById('region').textContent = name; }</script>`)
+		case "/regions":
+			_, _ = io.WriteString(w, `<title>Regions</title><label><input type="checkbox" value="Chiba">Chiba</label>
+<label><input type="checkbox" value="Funabashi">Funabashi</label>
+<button onclick="opener.setRegion([...document.querySelectorAll('input:checked')].map(box => box.value).join(', ')); window.close()">Register</button>`)
+		case "/details":
+			_, _ = io.WriteString(w, "<title>Details</title><p>Details of the bid</p>")
+		case "/home":
+			_, _ = io.WriteString(w, "<p>Home</p>")
+		case "/results":
+			answer(stopped)
+			_, _ = io.WriteString(w, `<body onload="top.closeSearching()"><p>Road repair</p><button onclick="this.textContent = 'Opened'">Open</button></body>`)
+		}
+	}))
+	t.Cleanup(server.Close)
+	// The server closes once its handlers return, so they stop waiting first.
+	t.Cleanup(stop)
+	return server.URL
+}
+
+// answerAfter returns an answer of serveWindowedSearch that comes after
+// delay.
+func answerAfter(delay time.Duration) func(context.Context) {
+	return func(stopped context.Context) {
+		select {
+		case <-time.After(delay):
+		case <-stopped.Done():
+		}
+	}
+}
+
+// gatedAnswer returns an answer of serveWindowedSearch that comes once
+// release is called.
+func gatedAnswer() (answer func(context.Context), release func()) {
+	gate := make(chan struct{})
+	answer = func(stopped context.Context) {
+		select {
+		case <-gate:
+		case <-stopped.Done():
+		}
+	}
+	return answer, sync.OnceFunc(func() { close(gate) })
+}
+
+// windowedSearchPress replays a press on a button of serveWindowedSearch's
+// menu frame, given by its position.
+func windowedSearchPress(ctx context.Context, eng engine, button int, timeout time.Duration) error {
+	selector := fmt.Sprintf("xpath=/html[1]/frameset[1]/frame[1]/html[1]/body[1]/button[%d]", button)
+	replayed, err := eng.Replay(ctx, recordedAction{Selector: selector, Method: "click"}, nil, timeout)
+	if err == nil && !replayed {
+		err = errors.New("the press was not replayed")
+	}
+	return err
+}
+
+// A "searching" window a search opens, which its answer closes, is not the
+// page the operations after the search work on, even when the answer takes
+// longer than a page takes to settle: the search waits for the answer, and
+// the snapshot, page text, extract, and act that follow read the results.
+func TestStagehandWorksBehindASearchingWindow(t *testing.T) {
+	t.Parallel()
+
+	act := treeModel(where(buttonNamed("Open")), "click")
+	model := func(ctx context.Context, req generateRequest) (generateResponse, error) {
+		if !strings.Contains(string(req.Schema), `"found"`) {
+			return act(ctx, req)
+		}
+		text := ""
+		for _, message := range req.Messages {
+			text += message.Text
+		}
+		return generateResponse{JSON: json.RawMessage(fmt.Sprintf(`{"found":%t}`, strings.Contains(text, "Road repair")))}, nil
+	}
+	eng := launchBrowser(t, launchOptions{Generate: model})
+	require.NoError(t, eng.Goto(t.Context(), serveWindowedSearch(t, answerAfter(1500*time.Millisecond)), time.Minute))
+	eng.(*stagehandEngine).settleWait = 200 * time.Millisecond
+
+	began := time.Now()
+	require.NoError(t, windowedSearchPress(t.Context(), eng, 1, time.Minute))
+	assert.Less(t, time.Since(began), 20*time.Second, "the search waited out its timeout")
+	snap, err := eng.Snapshot(t.Context())
+	require.NoError(t, err)
+	assert.Contains(t, snap.Tree, "Road repair", "the outline of the results")
+	assert.NotContains(t, snap.Tree, "Searching")
+	text, err := eng.PageText(t.Context())
+	require.NoError(t, err)
+	assert.Contains(t, text, "Road repair", "the text an expect reads")
+	found, err := eng.Extract(t.Context(), "Whether the page lists Road repair", json.RawMessage(`{"type":"object","properties":{"found":{"type":"boolean"}}}`), time.Minute)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"found":true}`, string(found), "what an extract reads")
+	outcome, err := eng.Act(t.Context(), "Click Open", nil, nil, time.Minute)
+	require.NoError(t, err)
+	require.True(t, outcome.Success, outcome.Message)
+	text, err = eng.PageText(t.Context())
+	require.NoError(t, err)
+	assert.Contains(t, text, "Opened", "the press the act made on the results")
+}
+
+// A search whose answer outlasts its timeout returns when the timeout ends,
+// and the operations that follow, a later press too, work on the page that
+// searched while the "searching" window is still up, until the answer
+// closes it.
+func TestStagehandSearchingWindowWaitEndsWithTimeout(t *testing.T) {
+	t.Parallel()
+
+	eng := launchBrowser(t, launchOptions{Generate: (&shopModel{}).generate})
+	answer, release := gatedAnswer()
+	require.NoError(t, eng.Goto(t.Context(), serveWindowedSearch(t, answer), time.Minute))
+	eng.(*stagehandEngine).settleWait = 200 * time.Millisecond
+
+	timeout := time.Second
+	began := time.Now()
+	require.NoError(t, windowedSearchPress(t.Context(), eng, 1, timeout))
+	// An operation is abandoned callTimeoutSlack after its timeout at the
+	// latest.
+	assert.Less(t, time.Since(began), timeout+callTimeoutSlack, "the search waited past its timeout")
+	snap, err := eng.Snapshot(t.Context())
+	require.NoError(t, err)
+	assert.Contains(t, snap.Tree, "Choose region", "the page that searched")
+	assert.NotContains(t, snap.Tree, "Searching")
+	require.NoError(t, windowedSearchPress(t.Context(), eng, 4, timeout), "a press on the page that searched")
+	text, err := eng.PageText(t.Context())
+	require.NoError(t, err)
+	assert.Contains(t, text, "Marked")
+	release()
+	require.Eventually(t, func() bool {
+		text, err := eng.PageText(t.Context())
+		return err == nil && strings.Contains(text, "Road repair")
+	}, 20*time.Second, 100*time.Millisecond, "the results, once they came")
+}
+
+// A window that stays open is a page to work on: one a press opens without
+// loading anything else, such as a list of regions to tick and register,
+// and one a press opens while its page loads, once that load has ended.
+func TestStagehandWorksInAWindowThatStays(t *testing.T) {
+	t.Parallel()
+
+	t.Run("dialog", func(t *testing.T) {
+		t.Parallel()
+		eng := launchBrowser(t, launchOptions{Generate: (&shopModel{}).generate})
+		require.NoError(t, eng.Goto(t.Context(), serveWindowedSearch(t, answerAfter(0)), time.Minute))
+
+		require.NoError(t, windowedSearchPress(t.Context(), eng, 2, time.Minute))
+		snap, err := eng.Snapshot(t.Context())
+		require.NoError(t, err)
+		assert.Contains(t, snap.Tree, "Register", "the window of regions")
+		for _, selector := range []string{"xpath=/html[1]/body[1]/label[2]/input[1]", "xpath=/html[1]/body[1]/button[1]"} {
+			replayed, err := eng.Replay(t.Context(), recordedAction{Selector: selector, Method: "click"}, nil, time.Minute)
+			require.NoError(t, err)
+			require.True(t, replayed, selector)
+		}
+		text, err := eng.PageText(t.Context())
+		require.NoError(t, err)
+		assert.Contains(t, text, "Funabashi", "the region the window registered")
+	})
+	t.Run("details", func(t *testing.T) {
+		t.Parallel()
+		eng := launchBrowser(t, launchOptions{Generate: (&shopModel{}).generate})
+		require.NoError(t, eng.Goto(t.Context(), serveWindowedSearch(t, answerAfter(1500*time.Millisecond)), time.Minute))
+		eng.(*stagehandEngine).settleWait = 200 * time.Millisecond
+
+		require.NoError(t, windowedSearchPress(t.Context(), eng, 3, time.Minute))
+		text, err := eng.PageText(t.Context())
+		require.NoError(t, err)
+		assert.Contains(t, text, "Details of the bid", "the window the search left open")
+	})
+}
+
+// serveRefreshedDetails serves a page built of frames whose Search for
+// details button opens a details window that stays and posts into the
+// content frame. The answer comes as serveWindowedSearch's does, and two
+// seconds after it loads the frame moves to a page that is not answered
+// while the server runs, as one that refreshes itself does; refreshing is
+// closed once that page is asked for.
+func serveRefreshedDetails(t *testing.T, answer func(context.Context)) (string, <-chan struct{}) {
+	t.Helper()
+	refreshing := make(chan struct{})
+	asked := sync.OnceFunc(func() { close(refreshing) })
+	stopped, stop := context.WithCancel(context.Background())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		switch r.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, `<frameset cols="200,*"><frame src="/menu"><frame name="main" src="/home"></frameset>`)
+		case "/menu":
+			_, _ = io.WriteString(w, `<form id="search" method="post" action="/results" target="main"></form>
+<button onclick="window.open('/details', 'details', 'width=800,height=600'); document.getElementById('search').submit()">Search for details</button>`)
+		case "/details":
+			_, _ = io.WriteString(w, "<title>Details</title><p>Details of the bid</p>")
+		case "/home":
+			_, _ = io.WriteString(w, "<p>Home</p>")
+		case "/results":
+			answer(stopped)
+			_, _ = io.WriteString(w, `<p>Road repair</p><script>onload = () => setTimeout(() => location.assign("/refresh"), 2000)</script>`)
+		case "/refresh":
+			asked()
+			<-stopped.Done()
+		}
+	}))
+	t.Cleanup(server.Close)
+	// The server closes once its handlers return, so they stop waiting first.
+	t.Cleanup(stop)
+	return server.URL, refreshing
+}
+
+// A window held while its opener loads what the press began is let go
+// once that load has ended and the quiet period passed, even when no
+// operation looked at it then: a load its opener begins later of its own
+// accord does not hold it again.
+func TestStagehandHeldWindowLetGoAfterItsLoad(t *testing.T) {
+	t.Parallel()
+
+	eng := launchBrowser(t, launchOptions{Generate: (&shopModel{}).generate})
+	answer, release := gatedAnswer()
+	site, refreshing := serveRefreshedDetails(t, answer)
+	require.NoError(t, eng.Goto(t.Context(), site, time.Minute))
+	eng.(*stagehandEngine).settleWait = 200 * time.Millisecond
+
+	// The press ends with its timeout while the window is still held.
+	require.NoError(t, windowedSearchPress(t.Context(), eng, 1, time.Second))
+	release()
+	select {
+	case <-refreshing:
+	case <-t.Context().Done():
+		t.Fatal("the content frame never refreshed")
+	}
+	// Reading the page does not hold the window again.
+	for range 2 {
+		text, err := eng.PageText(t.Context())
+		require.NoError(t, err)
+		assert.Contains(t, text, "Details of the bid", "the window that stayed")
+	}
+}
+
 // menuPage adds an Approve button once its menu is opened.
 const menuPage = `<p id="status">pending</p>
 <button onclick="openMenu()">Open menu</button>
@@ -1734,7 +1997,7 @@ func TestStagehandWaitEndingMidReadKeepsBrowser(t *testing.T) {
 			path:  "/changing",
 			limit: func(e *stagehandEngine, d time.Duration) { e.settleWait = d },
 			wait: func(e *stagehandEngine, ctx context.Context) {
-				e.settleDocument(ctx, time.Now().Add(e.settleWait))
+				e.settleDocument(ctx, time.Now().Add(e.settleWait), time.Time{})
 			},
 		},
 	} {
