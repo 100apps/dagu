@@ -890,6 +890,61 @@ func TestStagehandPageChecks(t *testing.T) {
 	assert.True(t, visible)
 }
 
+// serveFrames serves a page built of frames, as older sites are: a
+// frameset whose content frame is a frameset of its own, one of whose
+// frames hides its body, and a menu that holds a frame hidden by display
+// and one hidden by visibility.
+func serveFrames(t *testing.T) string {
+	t.Helper()
+	pages := map[string]string{
+		"/":          `<frameset cols="150,*"><frame src="/menu"><frame src="/main"></frameset>`,
+		"/menu":      `<p>Bid schedule</p><iframe src="/draft" style="display:none"></iframe><iframe src="/withdrawn" style="visibility:hidden"></iframe>`,
+		"/main":      `<frameset rows="40%,40%,20%"><frame src="/search"><frame src="/results"><frame src="/notice"></frameset>`,
+		"/search":    `<p>Search</p>`,
+		"/results":   `<table><tr><td>Road repair</td><td><a id="show" href="#">Show</a></td></tr></table>`,
+		"/notice":    `<body style="display:none"><p>Maintenance notice</p></body>`,
+		"/draft":     `<p id="draft">Unpublished case</p>`,
+		"/withdrawn": `<p id="withdrawn">Withdrawn case</p>`,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page, ok := pages[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, page)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+// A page's text and elements include those of the frames it shows, nested
+// ones too, and leave out the frames it hides and a body hidden in a frame.
+func TestStagehandPageChecksReadFrames(t *testing.T) {
+	t.Parallel()
+
+	eng := launchBrowser(t, launchOptions{Generate: (&shopModel{}).generate})
+	require.NoError(t, eng.Goto(t.Context(), serveFrames(t), time.Minute))
+
+	text, err := eng.PageText(t.Context())
+	require.NoError(t, err)
+	assert.Contains(t, text, "Bid schedule")
+	assert.Contains(t, text, "Road repair")
+	for _, hidden := range []string{"Unpublished case", "Withdrawn case", "Maintenance notice"} {
+		assert.NotContains(t, text, hidden)
+	}
+
+	visible, err := eng.SelectorVisible(t.Context(), "#show")
+	require.NoError(t, err)
+	assert.True(t, visible)
+	for _, hidden := range []string{"#draft", "#withdrawn"} {
+		visible, err = eng.SelectorVisible(t.Context(), hidden)
+		require.NoError(t, err)
+		assert.False(t, visible, hidden)
+	}
+}
+
 // A document keeps its ID while it stays loaded, and loading the same URL
 // again gives a new ID, as a form that posts back to its own page does.
 func TestStagehandDocumentID(t *testing.T) {

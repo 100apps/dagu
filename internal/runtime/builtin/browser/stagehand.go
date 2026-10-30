@@ -114,8 +114,26 @@ const watchExpression = `(() => {
 // was never watched, as one an action navigated to is not.
 var quietExpression = fmt.Sprintf(`(() => { const s = window.__daguSettle; return s ? s.pending <= 0 && Date.now() - s.changed >= %d : null; })()`, settleQuiet.Milliseconds())
 
-// pageTextExpression reads the text a person sees on the page.
-const pageTextExpression = `document.body ? document.body.innerText : ""`
+// shownDocumentsFunction declares shownDocuments, which returns a document
+// and the documents of the frames it shows, nested ones too. A frame from
+// another site cannot be read and is left out.
+const shownDocumentsFunction = `function shownDocuments(doc) {
+	const documents = [doc];
+	for (const frame of doc.querySelectorAll("frame, iframe")) {
+		const box = frame.getBoundingClientRect();
+		const shown = box.width > 0 && box.height > 0 && frame.checkVisibility({visibilityProperty: true});
+		if (frame.contentDocument && shown) documents.push(...shownDocuments(frame.contentDocument));
+	}
+	return documents;
+}`
+
+// pageTextExpression reads the text a person sees on the page, in the
+// frames it shows too. A body that is not rendered shows nothing, though
+// its innerText is the text it holds.
+const pageTextExpression = `(() => {
+	` + shownDocumentsFunction + `
+	return shownDocuments(document).map((doc) => doc.body && doc.body.checkVisibility() ? doc.body.innerText : "").filter(Boolean).join("\n");
+})()`
 
 // documentExpression reads the time the page's document began loading, which
 // differs for every document the page loads.
@@ -135,12 +153,16 @@ var sessionLostMarkers = []string{
 const contextLostMarker = "Cannot find context with specified id"
 
 // selectorVisibleExpression reports whether the selector, a JSON string
-// literal substituted for %s, matches any rendered, visible element.
-const selectorVisibleExpression = `Array.from(document.querySelectorAll(%s)).some((element) => {
-	const box = element.getBoundingClientRect();
-	const style = getComputedStyle(element);
-	return box.width > 0 && box.height > 0 && style.visibility !== "hidden" && style.display !== "none";
-})`
+// literal substituted for %s, matches any rendered, visible element of the
+// page or of the frames it shows.
+const selectorVisibleExpression = `(() => {
+	` + shownDocumentsFunction + `
+	return shownDocuments(document).some((doc) => Array.from(doc.querySelectorAll(%s)).some((element) => {
+		const box = element.getBoundingClientRect();
+		const style = doc.defaultView.getComputedStyle(element);
+		return box.width > 0 && box.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+	}));
+})()`
 
 // pageOutcomeExpression describes what the browser shows. On its error page
 // that is the network error code and the host of the page that did not
