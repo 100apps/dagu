@@ -174,7 +174,8 @@ type gatedResult struct {
 	WriteGate string  `json:"write_gate"`
 	Writes    []write `json:"writes"`
 	Error     *struct {
-		Code string `json:"code"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
 	} `json:"error"`
 }
 
@@ -481,4 +482,27 @@ func TestSessionRecordSendsAHeldForm(t *testing.T) {
 	assert.Equal(t, "amount=2500", approved.Body)
 	sent, _ = g.ledger.written()
 	assert.Equal(t, map[string]int{"/entries": 1}, sent)
+}
+
+// A goto to an address the policy declares a write is held like any other
+// write: the goto fails at once, since its page never loads, the page stays
+// where it was, and the write is reported.
+func TestSessionHoldsAGoto(t *testing.T) {
+	t.Parallel()
+
+	g := newGateEnv(t)
+	opened := g.open("--write-gate", "rehearse", "--write-policy", g.policy)
+	held := g.session(fmt.Sprintf(`{"goto": %q, "timeout": "30s"}`, g.ledger.url+"/entries/1/delete"), "do", opened.ID)
+	held.ExpectNonZeroExitCode()
+	result := decode(t, held)
+	require.NotNil(t, result.Error, held.Stdout())
+	assert.Equal(t, "operation_failed", result.Error.Code)
+	// A goto that waited out its timeout would fail too, saying so.
+	assert.Contains(t, result.Error.Message, "cancelled the load")
+	assert.Equal(t, g.ledger.url+"/", result.URL)
+	deleted, ok := byPath(result.Writes)["/entries/1/delete"]
+	require.True(t, ok, held.Stdout())
+	assert.Equal(t, "write blocked", deleted.Class+" "+deleted.Outcome)
+	sent, _ := g.ledger.written()
+	assert.Empty(t, sent)
 }
