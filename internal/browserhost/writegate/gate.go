@@ -38,6 +38,14 @@ const (
 	// a network error, and the browser does not count it among the
 	// requests allowed_domains blocked.
 	accessDenied = "AccessDenied"
+	// aborted is the reason a blocked page load a page started fails
+	// with. The browser cancels the load without an error page, so the
+	// frame keeps its document, a form as it was filled in, and the browser
+	// does not count it among the requests allowed_domains blocked.
+	aborted = "Aborted"
+	// noReferrer is the referrer policy under which a page sends no
+	// Referer.
+	noReferrer = "no-referrer"
 )
 
 // Control paths, under the token.
@@ -54,10 +62,12 @@ const (
 // operation that never ended may send stop being sent.
 const maxLease = 30 * time.Minute
 
-// notSentPage answers a page load the gate blocked, so the page shows
-// where it stopped instead of a network error.
+// notSentPage answers a blocked page load the browser started on its own,
+// as a goto does. Nothing on a page asked for it, so there is no page to
+// keep, and whoever started it waits for a page that a cancelled load
+// never brings.
 const notSentPage = `<!doctype html><html><head><meta charset="utf-8"><title>Not sent</title></head>` +
-	`<body><h1>Not sent</h1><p>The browser held back this form; nothing was saved.</p></body></html>`
+	`<body><h1>Not sent</h1><p>The browser held back this page load; nothing was saved.</p></body></html>`
 
 // Config is what a gate decides, and for which browser.
 type Config struct {
@@ -446,6 +456,9 @@ type pausedRequest struct {
 		Headers      map[string]string `json:"headers"`
 		PostData     string            `json:"postData"`
 		PostDataSize int64             `json:"postDataSize"`
+		// ReferrerPolicy is the policy the request was sent under, which
+		// tells a page that withheld its address.
+		ReferrerPolicy string `json:"referrerPolicy"`
 	} `json:"request"`
 	ResponseHeaders []header `json:"responseHeaders"`
 }
@@ -515,15 +528,37 @@ func (g *gate) paused(sessionID string, params json.RawMessage) {
 	// the page's answer finds the write in the ledger.
 	event.Outcome = OutcomeBlocked
 	g.ledger.add(event)
-	if req.ResourceType == resourceDocument {
+	switch {
+	case req.ResourceType != resourceDocument:
+		g.send(sessionID, "Fetch.failRequest", map[string]any{"requestId": p.RequestID, "errorReason": accessDenied})
+	case startedByPage(p):
+		g.send(sessionID, "Fetch.failRequest", map[string]any{"requestId": p.RequestID, "errorReason": aborted})
+	default:
 		g.send(sessionID, "Fetch.fulfillRequest", map[string]any{
 			"requestId": p.RequestID, "responseCode": http.StatusOK,
 			"responseHeaders": []map[string]string{{"name": "Content-Type", "value": "text/html; charset=utf-8"}},
 			"body":            base64.StdEncoding.EncodeToString([]byte(notSentPage)),
 		})
-	} else {
-		g.send(sessionID, "Fetch.failRequest", map[string]any{"requestId": p.RequestID, "errorReason": accessDenied})
 	}
+}
+
+// startedByPage reports whether a page started the load p asks for, as a
+// form or a link does, rather than the browser on its own, as a goto does.
+// Only a page loads a document with a method other than GET, and a page's
+// load names the page as its Referer unless the page or the link withholds
+// it with the no-referrer policy. A load whose Referer the policy drops for
+// another reason, such as going from HTTPS to HTTP, is taken for the
+// browser's own.
+func startedByPage(p pausedRequest) bool {
+	if p.Request.Method != http.MethodGet || p.Request.ReferrerPolicy == noReferrer {
+		return true
+	}
+	for name, value := range p.Request.Headers {
+		if strings.EqualFold(name, "Referer") && value != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // describe returns the event of a write.
