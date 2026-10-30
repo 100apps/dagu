@@ -1944,3 +1944,83 @@ func TestStagehandWriteGateDecidesFromTheFirstPage(t *testing.T) {
 	assert.Equal(t, "POST "+server.URL+"/save", writes[0].String())
 	assert.Equal(t, []string{"note"}, writes[0].Fields)
 }
+
+// serveRowForm serves a page built of frames whose form, in a frame, is laid
+// out in a table: each control is named only by the label cell of its row,
+// as forms of older sites are, two fields of a date range share one, and
+// one field follows a button. Outside the table, a field and a field in
+// the shadow root of its host are named by nothing but their name
+// attributes.
+func serveRowForm(t *testing.T) string {
+	t.Helper()
+	pages := map[string]string{
+		"/":     `<frameset cols="30%,70%"><frame src="/menu"><frame name="main" src="/form"></frameset>`,
+		"/menu": `<p>Menu</p>`,
+		"/form": `<form><table border="1">
+<tr><th>工種又は業種</th><td><select name="KoujiSyubetu"><option></option><option>土木一式工事</option></select></td></tr>
+<tr><th>案件名</th><td><input type="text" name="AnkenName"></td></tr>
+<tr><td>添付あり</td><td><input type="checkbox" name="Tenpu"></td></tr>
+<tr><th>入札予定日範囲</th><td><input type="text" name="DateFrom"> ～ <input type="text" name="DateTo"></td></tr>
+<tr><th>文字列検索</th><td><input type="text" name="Mojiretu"> <select name="AndOr"><option>AND</option><option>OR</option></select></td></tr>
+<tr><th>担当課</th><td><button type="button">選択</button></td><td><input type="text" name="Tantoka"></td></tr>
+<tr><td><input type="text" name="FreeWord"></td></tr>
+</table><x-field id="host"><input type="text" name="Slotted"></x-field></form>
+<script>document.getElementById("host").attachShadow({mode: "open"}).innerHTML = '<input type="text" name="Inner"><slot></slot>'</script>`,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, pages[r.URL.Path])
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+// A control a form names only by its table row, or by its name attribute,
+// in a frame, is outlined by that name and taken by an element operation by
+// its ID: a select picks its option, a field takes text, and a checkbox is
+// checked. Fields that share a row's label are told apart by their order,
+// and a field in a shadow root takes its own name attribute.
+func TestStagehandNamesControlsByTheirRow(t *testing.T) {
+	t.Parallel()
+
+	eng := launchBrowser(t, launchOptions{Generate: (&shopModel{}).generate})
+	require.NoError(t, eng.Goto(t.Context(), serveRowForm(t), time.Minute))
+	snap, err := eng.Snapshot(t.Context())
+	require.NoError(t, err)
+	outline, _, _ := renderOutline(snap, outlineOptions{})
+	idOf := func(line string) string {
+		t.Helper()
+		match := regexp.MustCompile(`\[(\d+-\d+)\] ` + regexp.QuoteMeta(line)).FindStringSubmatch(outline)
+		require.NotNil(t, match, "%s in\n%s", line, outline)
+		return match[1]
+	}
+
+	for _, op := range []elementOperation{
+		{kind: opSelect, element: idOf(`select "工種又は業種"`), text: "土木一式工事"},
+		{kind: opType, element: idOf(`textbox "案件名"`), text: "道路"},
+		{kind: opClick, element: idOf(`checkbox "添付あり"`)},
+		{kind: opType, element: idOf(`textbox "入札予定日範囲 2"`), text: "2026/04/30"},
+		{kind: opType, element: idOf(`textbox "FreeWord"`), text: "舗装"},
+	} {
+		_, action, err := elementAct(snap, op, nil)
+		require.NoError(t, err, op.element)
+		replayed, err := eng.Replay(t.Context(), action, nil, time.Minute)
+		require.NoError(t, err, op.element)
+		require.True(t, replayed, op.element)
+	}
+
+	snap, err = eng.Snapshot(t.Context())
+	require.NoError(t, err)
+	outline, _, _ = renderOutline(snap, outlineOptions{})
+	assert.Contains(t, outline, `select "工種又は業種" = 土木一式工事`)
+	assert.Contains(t, outline, `checkbox "添付あり" [checked]`)
+	assert.Contains(t, outline, `textbox "入札予定日範囲 1"`)
+	assert.Contains(t, outline, `textbox "文字列検索"`)
+	assert.Contains(t, outline, `select "文字列検索" = AND`)
+	assert.Contains(t, outline, `textbox "担当課"`)
+	assert.Contains(t, outline, `textbox "Inner"`)
+	assert.Contains(t, outline, `textbox "Slotted"`)
+	typed, err := eng.(*stagehandEngine).evaluate(t.Context(), `Object.fromEntries([...frames[1].document.querySelectorAll("input[type=text]")].map((input) => [input.name, input.value]))`)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"AnkenName":"道路","DateFrom":"","DateTo":"2026/04/30","Mojiretu":"","Tantoka":"","FreeWord":"舗装","Slotted":""}`, string(typed))
+}
