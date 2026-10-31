@@ -25,6 +25,7 @@ on:
       - "ui/**"
       - ".github/actions/setup-go-cache/**"
       - ".github/workflows/ci.yaml"
+      - ".github/opencode/**"
   pull_request:
     # Keep this workflow directly rerunnable from PR-only maintenance commits.
     types:
@@ -50,6 +51,7 @@ on:
       - "ui/**"
       - ".github/actions/setup-go-cache/**"
       - ".github/workflows/ci.yaml"
+      - ".github/opencode/**"
   workflow_dispatch:
 
 permissions:
@@ -122,7 +124,7 @@ jobs:
           windows_installer_changed=false
           while IFS= read -r file; do
             case "${file}" in
-              *.go|go.mod|go.sum|Makefile|scripts/ci/*|.github/actions/setup-go-cache/*|.github/workflows/ci.yaml)
+              *.go|go.mod|go.sum|Makefile|scripts/ci/*|.github/opencode/*|.github/actions/setup-go-cache/*|.github/workflows/ci.yaml)
                 go_changed=true
                 ;;
             esac
@@ -354,6 +356,11 @@ jobs:
           DAGU_TEST_OPENCODE_EXECUTABLE: opencode
           DAGU_TEST_OPENCODE_VERSION: 1.18.11
         run: go test ./internal/opencodehost -run '^TestRealOpenCodeCapabilities$' -count=1
+
+      - name: Test managed OpenCode v2 execution
+        env:
+          DAGU_TEST_OPENCODE_V2_EXECUTABLE: ${{ github.workspace }}/.github/opencode/node_modules/@opencode/cli-linux-x64-baseline/bin/opencode
+        run: go test ./internal/runtime/builtin/harness -run '^TestRealV2Run$' -count=1
 
       - name: Test with the legacy JSON backend
         env:
