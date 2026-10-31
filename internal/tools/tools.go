@@ -158,8 +158,6 @@ func ToolsetHash(cfg *ir.ToolConfig, platform string) (string, []byte, error) {
 		}
 		snapshot = data
 		digest := sha256.Sum256(snapshot)
-		// A distinct key prevents reuse of pre-snapshot manifests, which may
-		// have installed bytes different from the registry that was hashed.
 		payload.LocalRegistrySnapshotDigest = hex.EncodeToString(digest[:])
 	}
 	data, err := json.Marshal(payload)
